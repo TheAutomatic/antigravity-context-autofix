@@ -1,0 +1,26 @@
+# Never commit proprietary binaries, archives, or local backups
+*.exe
+*.dll
+*.so
+*.dylib
+*.bak
+*.orig
+*.gz
+*.tgz
+*.tar
+*.zip
+*.7z
+*.db
+*.sqlite
+*.pb
+agy
+language_server
+*manifest*.json
+agy.version.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
