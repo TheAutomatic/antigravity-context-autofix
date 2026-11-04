@@ -5,41 +5,53 @@ Checks:
 - Both ~/.gemini/antigravity/conversations/<cid>.db and ~/.gemini/antigravity-cli/conversations/<cid>.db
 - Latest turn (and idx=0) executor_metadata checkpoint max_token_limit (expected 983040)
 - Latest turn (and idx=0) gen_metadata ChatStartMetadata.ContextWindowMetadata.max_context_tokens (expected 983040)
-- Optional AGENTS.md full injection in user_rules section without budget exclusion notice
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import sqlite3
+import tempfile
+import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 
 def read_varint(b: bytes, p: int):
-    v = s = 0
-    while True:
+    v = 0
+    for index in range(10):
+        if p >= len(b):
+            raise ValueError("Truncated protobuf varint")
         x = b[p]
         p += 1
-        v |= (x & 127) << s
-        s += 7
+        if index == 9 and x > 1:
+            raise ValueError("Protobuf varint exceeds uint64")
+        v |= (x & 127) << (index * 7)
         if x < 128:
             return v, p
-        if s > 70:
-            raise ValueError("Invalid protobuf varint")
+    raise ValueError("Invalid protobuf varint")
 
 
 def iter_fields(b: bytes):
     p = 0
     while p < len(b):
         t, p = read_varint(b, p)
+        if not 1 <= t >> 3 <= 0x1FFFFFFF:
+            raise ValueError("Invalid protobuf field number")
         w = t & 7
         if w == 0:
             v, p = read_varint(b, p)
         elif w == 2:
             n, p = read_varint(b, p)
+            if n > len(b) - p:
+                raise ValueError("Truncated protobuf length-delimited field")
             v = b[p : p + n]
             p += n
         elif w in (1, 5):
             n = 8 if w == 1 else 4
+            if n > len(b) - p:
+                raise ValueError("Truncated protobuf fixed-width field")
             v = b[p : p + n]
             p += n
         else:
@@ -47,15 +59,36 @@ def iter_fields(b: bytes):
         yield t >> 3, w, v
 
 
-def get_field(b: bytes, k: int):
-    return next(v for f, w, v in iter_fields(b) if f == k)
+def get_field(b: bytes, k: int, wire=2):
+    # Consume the entire message so malformed trailing fields cannot pass validation.
+    fields = list(iter_fields(b))
+    values = [(w, v) for f, w, v in fields if f == k]
+    if not values:
+        raise ValueError(f"Missing protobuf field {k}")
+    if any(w != wire for w, _ in values):
+        raise ValueError(f"Unexpected wire type for protobuf field {k}")
+    return values[-1][1]
 
 
-def find_conversation_db(cid: str | None) -> Path:
-    dirs = [
+def conversation_dirs():
+    return [
         Path.home() / ".gemini" / "antigravity" / "conversations",
         Path.home() / ".gemini" / "antigravity-cli" / "conversations",
     ]
+
+
+def database_activity(path):
+    """Include uncheckpointed request writes when selecting a recent session."""
+    times = [path.stat().st_mtime]
+    try:
+        times.append(Path(str(path) + "-wal").stat().st_mtime)
+    except FileNotFoundError:
+        pass
+    return max(times)
+
+
+def find_conversation_db(cid: str | None) -> Path:
+    dirs = conversation_dirs()
     if cid:
         for d in dirs:
             cand = d / f"{cid}.db"
@@ -69,57 +102,71 @@ def find_conversation_db(cid: str | None) -> Path:
             all_dbs.extend(d.glob("*.db"))
     if not all_dbs:
         raise SystemExit(f"No conversation .db files found in {dirs}")
-    return max(all_dbs, key=lambda p: p.stat().st_mtime)
+    return max(all_dbs, key=database_activity)
 
 
 def parse_gen_row(g: bytes):
     chat = get_field(g, 1)
     window = get_field(get_field(chat, 9), 10)
-    gen_limit = get_field(window, 4)
+    gen_limit = get_field(window, 4, wire=0)
     return chat, gen_limit
 
 
 def parse_exec_row(e: bytes):
-    return get_field(get_field(get_field(e, 10), 2), 5)
+    return get_field(get_field(get_field(e, 10), 2), 5, wire=0)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Verify actual request context window and AGENTS.md injection in session DB.")
-    ap.add_argument("conversation_id", nargs="?", help="Conversation UUID (omit to inspect the newest .db automatically)")
-    ap.add_argument("--agents", type=Path, help="Optional path to project AGENTS.md to verify full byte-for-byte injection")
-    ap.add_argument("--expected-limit", type=int, default=983040, help="Expected max_context_tokens (default: 983040)")
-    args = ap.parse_args()
+@contextmanager
+def open_session_db(db_path):
+    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        conn.execute("select name from sqlite_master limit 1").fetchone()
+    except sqlite3.OperationalError:
+        conn.close()
+        # Some read-only directories cannot supply SQLite's shared-memory files.
+        # Only copy a stable standalone database; never ignore a WAL.
+        if any(Path(str(db_path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+            raise
+        before = db_path.stat()
+        with tempfile.TemporaryDirectory(prefix="agy-db-read-") as folder:
+            copy = Path(folder) / "session.db"
+            shutil.copyfile(db_path, copy)
+            after = db_path.stat()
+            if ((before.st_ino, before.st_size, before.st_mtime_ns) !=
+                    (after.st_ino, after.st_size, after.st_mtime_ns) or
+                    any(Path(str(db_path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal"))):
+                raise RuntimeError("Session DB changed during snapshot; retry or close the IDE")
+            conn = sqlite3.connect(copy.as_uri() + "?mode=ro&immutable=1", uri=True)
+            try:
+                yield conn, "stable_standalone_copy"
+            finally:
+                conn.close()
+        return
+    try:
+        yield conn, "read_only"
+    finally:
+        conn.close()
 
-    db_path = find_conversation_db(args.conversation_id)
-    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
 
-    g_first_idx, g_first = conn.execute("select idx, data from gen_metadata order by idx asc limit 1").fetchone()
-    g_last_idx, g_last = conn.execute("select idx, data from gen_metadata order by idx desc limit 1").fetchone()
-    _, gen_limit_first = parse_gen_row(g_first)
-    chat_last, gen_limit_last = parse_gen_row(g_last)
+def inspect_session(conversation_id=None, expected_limit=983040, db_path=None):
+    db_path = db_path.expanduser().resolve() if db_path else find_conversation_db(conversation_id)
+    with open_session_db(db_path) as (conn, read_mode):
+        conn.execute("BEGIN")
+        if not conn.execute("select 1 from gen_metadata limit 1").fetchone() or not conn.execute("select 1 from executor_metadata limit 1").fetchone():
+            raise ValueError("Session has no request metadata yet")
+        g_first_idx, g_first = conn.execute("select idx, data from gen_metadata order by idx asc limit 1").fetchone()
+        g_last_idx, g_last = conn.execute("select idx, data from gen_metadata order by idx desc limit 1").fetchone()
+        _, gen_limit_first = parse_gen_row(g_first)
+        _, gen_limit_last = parse_gen_row(g_last)
 
-    e_first_idx, e_first = conn.execute("select idx, data from executor_metadata order by idx asc limit 1").fetchone()
-    e_last_idx, e_last = conn.execute("select idx, data from executor_metadata order by idx desc limit 1").fetchone()
-    exec_limit_first = parse_exec_row(e_first)
-    exec_limit_last = parse_exec_row(e_last)
+        e_first_idx, e_first = conn.execute("select idx, data from executor_metadata order by idx asc limit 1").fetchone()
+        e_last_idx, e_last = conn.execute("select idx, data from executor_metadata order by idx desc limit 1").fetchone()
+        exec_limit_first = parse_exec_row(e_first)
+        exec_limit_last = parse_exec_row(e_last)
 
-    sections = []
-    original_agents = args.agents.read_bytes() if args.agents else None
-    for f, w, v in iter_fields(chat_last):
-        if f == 16:
-            title = get_field(v, 1).decode("utf-8", errors="replace")
-            content = get_field(v, 2)
-            if b"AGENTS.md" in content or title == "user_rules":
-                entry = {
-                    "title": title,
-                    "bytes": len(content),
-                    "excluded": b"exceeded the rules token budget" in content,
-                }
-                if original_agents is not None:
-                    entry["contains_full_agents"] = original_agents in content
-                sections.append(entry)
 
     report = {
+        "read_mode": read_mode,
         "db_path": str(db_path),
         "conversation_id": db_path.stem,
         "first_turn": {
@@ -134,16 +181,29 @@ def main():
             "executor_idx": e_last_idx,
             "executor_max_token_limit": exec_limit_last,
         },
-        "expected_limit": args.expected_limit,
-        "latest_limit_ok": (gen_limit_last == args.expected_limit and exec_limit_last == args.expected_limit),
-        "sections": sections,
+        "expected_limit": expected_limit,
+        "latest_limit_ok": (gen_limit_last == expected_limit and exec_limit_last == expected_limit),
     }
-    if original_agents is not None:
-        report["agents_bytes"] = len(original_agents)
-        report["agents_ok"] = any(s.get("contains_full_agents") and not s["excluded"] for s in sections)
+    return report
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Read actual request context window from the session DB.")
+    ap.add_argument("conversation_id", nargs="?", help="Conversation UUID (omit to inspect the newest .db automatically)")
+    ap.add_argument("--db", type=Path, help="Read an explicit conversation database")
+    ap.add_argument("--expected-limit", type=int, default=983040, help="Expected max_context_tokens (default: 983040)")
+    args = ap.parse_args()
+    if args.db and args.conversation_id:
+        ap.error("Choose --db or conversation_id, not both")
+
+    try:
+        report = inspect_session(args.conversation_id, args.expected_limit, args.db)
+    except (Exception, SystemExit) as exc:
+        print(json.dumps({"state": "UNKNOWN", "error": str(exc)}, ensure_ascii=False))
+        raise SystemExit(2)
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
-    if not report["latest_limit_ok"] or (original_agents is not None and not report["agents_ok"]):
+    if not report["latest_limit_ok"]:
         raise SystemExit(1)
 
 

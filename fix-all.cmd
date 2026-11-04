@@ -14,10 +14,10 @@ if not defined PY (
 )
 
 echo === Antigravity 1M Context ^& Rules Auto-Patcher ===
-echo Note: Will stop running agy.exe / language_server.exe processes before patching.
+echo Note: Review targets and type Y to continue.
 echo Please close Antigravity IDE / Desktop windows first so they do not auto-restart the backend mid-patch.
 echo.
-"%PY%" "%~dp0fix_antigravity_context.py" --kill %*
+"%PY%" "%~dp0fix_antigravity_context.py" %*
 echo.
 pause
 

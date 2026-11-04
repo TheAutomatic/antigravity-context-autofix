@@ -2,93 +2,157 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-A cross-version, zero-dependency automatic symbol locator and one-click patcher to unlock the full **1M context window (`983,040` tokens)** and **`AGENTS.md` rules budget (`1 MiB` / `131,072` tokens)** for **Antigravity IDE**, **Antigravity Desktop**, and **`agy` CLI** across Windows and Linux.
+Patch the local Antigravity backend to raise the Argon High / Medium / Low request context window to an expected **983040 tokens**, and adjust automatic checkpoint behavior and rule budgets. One Python script provides discovery, compatibility checks, recorded-context inspection, backup and patching after confirmation, and original-byte restoration. **Python 3.9+ standard library only.** No proprietary binaries are distributed.
 
-Requires only the Python 3 standard library. Does not distribute any proprietary binaries.
+## Expected compatibility
 
----
+| System | Backend architecture / format | Intended clients | Validation |
+|---|---|---|---|
+| Windows | x86_64 / PE | Antigravity IDE, Antigravity Desktop, agy CLI | Patch support implemented; current builds have not been tested on a Windows machine |
+| Windows | ARM64 / PE | Outside the expected scope for now | Unvalidated; compatibility is not guaranteed |
+| Linux | x86_64 / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
+| Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
+| macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | IDE 2.6.0 / agy 1.4.12 tested locally: patching, signing, startup and a new request window |
+| macOS | x86_64 (Intel) or Universal Mach-O | Unsupported | The parser only supports thin ARM64 Mach-O |
 
-## Acknowledgments & Background
+Each backend must pass local structural checks; compatibility across all versions is not guaranteed. Multiple clients may share a backend: on the tested Mac, IDE and CLI share `~/.gemini/bin/agy` and must be restarted after patching. Intended clients do not imply that every installation layout has been tested.
 
-- Special thanks to **[@lmxxf](https://github.com/lmxxf)** for the root-cause investigation and sharing.
-- Also thanks to **Antigravity IDE** — the Windows backend architecture discovery, cross-version Go `pclntab` auto-locator script, and end-to-end session database verification in this repository were built collaboratively with the Agent running inside Antigravity IDE itself.
+## Run
 
-For the full investigation into why Antigravity's `/context` panel displays **1.0M tokens** for Gemini 4 Argon while actual requests truncate history at **256K**, and why large `AGENTS.md` files get truncated or excluded due to per-file and token budget caps, please refer to [@lmxxf](https://github.com/lmxxf)'s upstream repository and write-up:
-- Upstream repository: [https://github.com/lmxxf/antigravity-context-fix](https://github.com/lmxxf/antigravity-context-fix)
-- Detailed write-up: [Article 340-A](https://github.com/lmxxf/ai-theorys-study/blob/main/wechat/340-A.md)
-
-**What this repository adds:**
-While the upstream repository maintains fixed-offset binary patches for specific Linux `agy` builds, this project provides a **cross-platform, cross-version pure-script auto-locator (`autofix`)**:
-- Parses Go `pclntab` symbol tables and getter instructions directly from the local binary to dynamically resolve function addresses and struct field offsets — **when the client auto-updates, simply re-run the script without waiting for manual offset updates**;
-- Supports both **Windows (`x86_64` PE)** (**Antigravity IDE**, **`agy` CLI**, and **Antigravity Desktop**, including automatic `agy.version.json` sidecar synchronization) and **Linux (`x86_64` / `ARM64` ELF)**.
-
-**Summary of changes (aligned with upstream):**
-1. Sets `max_token_limit = 1,000,000` (resulting in an actual request limit of **`983,040` tokens** after the 65,536 output reservation) at the final config merge exit for Gemini 4 Argon High / Medium / Low;
-2. Short-circuits automatic checkpoint predicate (`hooks.checkpointNeeded`) to return `(false, nil)` and uses its unreachable body for the trampoline without changing file size;
-3. Raises single-file rule/skill read cap: `24,000` → `1,048,576` bytes (`1 MiB`);
-4. Raises aggregate `rules` and `customizations` token budgets: `20,000` → `131,072` tokens each.
-
----
-
-## Supported Targets
-
-- **Windows (`x86_64` PE)** (auto-discovered by default):
-  - `C:\Users\<User>\.gemini\bin\agy.exe` (shared backend for **Antigravity IDE** and **`agy` CLI**)
-  - `C:\Users\<User>\AppData\Local\Programs\antigravity\resources\bin\language_server.exe` (**Antigravity Desktop** backend)
-- **Linux (`x86_64` / `ARM64` ELF)**:
-  - `~/.local/bin/agy` or `~/.gemini/bin/agy`
-
----
-
-## Quick Start
-
-### Windows (Double-Click or CLI)
-
-1. **Read-only status check (can be run while IDE is open)**:
-   Double-click `check-status.cmd`, or run:
-   ```powershell
-   python fix_antigravity_context.py --check
-   ```
-
-2. **One-click auto-locate & patch (re-run after client updates)**:
-   Close Antigravity IDE / Desktop windows first, then double-click `fix-all.cmd`, or run:
-   ```powershell
-   python fix_antigravity_context.py --kill
-   ```
-   > Original binaries are backed up to `C:\Users\<User>\.gemini\agy-patches\`. Restart the client to take effect.
-
-3. **Verify session SQLite database (`983040` limit)**:
-   Double-click `verify-latest.cmd`, or run:
-   ```powershell
-   python verify_session.py
-   ```
-
-4. **Restore original binaries**:
-   Double-click `restore-all.cmd`, or run:
-   ```powershell
-   python fix_antigravity_context.py --kill --restore
-   ```
-
-### Linux (`x86_64` / `ARM64`)
+Run from the repository. Use `python` on Windows, `python3` on macOS / Linux. An absolute script path works from any directory.
 
 ```bash
-# Read-only check
-python3 fix_antigravity_context.py --check --target ~/.local/bin/agy
-
-# Auto-locate and patch
-python3 fix_antigravity_context.py --target ~/.local/bin/agy
-
-# Verify session database
-python3 verify_session.py <conversation_id> --agents /path/to/AGENTS.md
-
-# Restore original binary
-python3 fix_antigravity_context.py --restore --target ~/.local/bin/agy
+# Read-only discovery, compatibility and context report
+python3 fix_antigravity_context.py --status
+# Review targets and type Y before backups / patching
+python3 fix_antigravity_context.py
+# Verify matching backups, review targets and type Y to restore
+python3 fix_antigravity_context.py --restore
 ```
 
----
+Windows wrappers: check-status.cmd, fix-all.cmd, restore-all.cmd, verify-latest.cmd. They do not terminate processes by default.
 
-## Disclaimer
+## Workflow
 
-1. **No Proprietary Binary Redistribution**: This repository contains only original Python standard-library scripts and batch wrappers. It **does not contain or distribute** any Google Antigravity (`agy` / `language_server`) executables or archives. Do not commit `.exe`, `agy.gz`, or `.bak` binaries to version control.
-2. **No Auth, Billing, or Quota Circumvention**: This tool does not modify or bypass any authentication (OAuth), permission checks, sandboxing, or server-side rate/quota limits. It only aligns local client configuration merging with the 1.0M context window advertised in the UI and adjusts local workspace rule (`AGENTS.md`) truncation thresholds.
-3. **Use at Your Own Risk**: Modifying local client binaries is unofficial and may break with upstream changes. Provided strictly for personal technical research, debugging, and interoperability study.
+1. Discover current-user default locations, PATH and known application directories. Resolve symlinks and deduplicate real paths.
+2. Report each backend's format, architecture, SHA256, patch state and compatibility.
+3. Report the most recently modified database separately for IDE and CLI. No model launch or request is sent.
+4. In patch mode, stop before changes if any selected backend is incompatible or partially patched. Use repeated `--target PATH` options to select a supported subset. Restore independently verifies current-file and backup hashes without requiring patch-parser compatibility.
+5. List actual action paths and backup directory. Only explicit Y at `Continue? [y/N]` proceeds. Enter, other input and EOF cancel. If all files are patched already, exit without changes.
+6. List running backend process names and PIDs. Close the IDE / CLI and type Y to check again; cancel otherwise. Processes are not terminated by default.
+7. Back up and verify original SHA256, patch a temporary file, sign / verify on macOS, and record the final hash. Recheck processes and current file hash before atomic replacement.
+8. Update the version sidecar and recheck patch state. Each backend is independent: failure midway through multiple targets does not roll back completed targets, which retain their backups.
+
+`--status`, `--check` and `--dry-run` are equivalent read-only modes: no prompt, termination or backend writes. `--json-out` writes the requested report; database access may use a temporary read-only snapshot.
+
+Linux matches /proc/PID/exe paths to avoid truncated process names. Windows / macOS use conservative name matching, which may include another installation. Process inspection failure stops writes; it is not exhaustive file-lock inspection. Replacement permissions / lock failures also prompt for Y to retry after fixing the issue. Automatic process termination is opt-in with `--kill` and occurs only after confirmation; same-name processes from another installation may be affected.
+
+## Installation discovery
+
+On every system, discovery starts with the current user's .gemini/bin and .local/bin directories and PATH, then checks Antigravity-named products in these directories:
+
+- Windows: LOCALAPPDATA/Programs, ProgramFiles and ProgramFiles(x86).
+- macOS: /Applications and ~/Applications.
+- Linux: /opt, /usr/share, /usr/lib and ~/.local/share.
+
+Within applications, discovery checks known bin, resources/bin, resources/app/bin and extension bin layouts; macOS uses Contents/Resources. Candidate names include agy, language_server and known platform variants.
+
+Discovery is bounded, not a disk-wide scan or other-user scan. Portable copies, arbitrary paths, containers, remote hosts and unknown layouts can be missed. `--target` replaces discovery and is repeatable:
+
+```bash
+python3 fix_antigravity_context.py --status --target /actual/path/agy
+python3 fix_antigravity_context.py --target /one/agy --target /two/language_server
+```
+
+## Status interpretation and context inspection
+
+The latest active DB from each directory is reported separately, considering both the database and its -wal modification time:
+
+- `~/.gemini/antigravity/conversations/*.db` (IDE / some desktop sessions)
+- `~/.gemini/antigravity-cli/conversations/*.db` (CLI)
+
+These databases are not mapped to a particular discovered executable. They may belong to an older build, another install or another model. Empty, unreadable or changed-schema databases produce UNKNOWN. Truncated protobuf fields, overflowed varints and wrong wire types also fail parsing instead of passing acceptance.
+
+| State | Meaning |
+|---|---|
+| UNPATCHED / compatible=True | Recognized original patch sites |
+| ALREADY_PATCHED / compatible=True | On-disk expected patch; running processes may still use old code |
+| UNSUPPORTED_OR_UNRECOGNIZED | Format, symbols or instructions cannot be matched |
+| UNKNOWN_OR_PARTIAL | Neither recognized original nor complete patch; refuse patching, but hash-verified restoration remains available |
+| LIMITED_256K | Both recorded request and executor limits are 256000 |
+| EXPECTED_WINDOW | Both are 983040 |
+| MIXED_LIMITS / OTHER_WINDOW | Differing limits or another window; inspect model choice |
+| UNKNOWN | Insufficient evidence |
+
+Restart the IDE / CLI after patching, send a new Argon High / Medium / Low request and inspect that conversation:
+
+```bash
+python3 fix_antigravity_context.py --status --conversation-id UUID
+python3 fix_antigravity_context.py --status --db /path/session.db
+python3 verify_session.py UUID
+python3 verify_session.py --db /path/session.db
+```
+
+Acceptance reports `latest_limit_ok: true` when both limits match. A stored window does not prove future requests, all models or retention beyond 256K. Recheck after changing models. Lost or summarized history is not restored. No test request is sent automatically.
+
+## Changes and signing
+
+- At final config merge, set max_token_limit=1000000 for Argon High / Medium / Low (IDs 1417–1419); observed request window is **983040**.
+- Return (false, nil) from automatic checkpoint predicate and reuse unreachable code for a trampoline. This does not disable every truncation path; manual compact is untested.
+- Raise per-file rule / skill cap from 24000 bytes to **1 MiB**.
+- Raise rules and customizations budgets from 20000 to **131072 tokens** each. Rule / checkpoint changes are not gated by the three-model window condition.
+
+Code edits preserve length; macOS signing may change final size. System codesign performs ad-hoc signing with `--force --sign -` on a temporary file, without a developer certificate. Signing and patch checks must pass before replacement. Vendor identity / notarization trust is not retained. Gatekeeper and SIP are not disabled.
+
+## Updates and relocation limits
+
+Thanks to [@lmxxf](https://github.com/lmxxf) for the investigation and patch strategy, and Antigravity IDE for collaboration on Windows architecture, relocation and verification.
+
+- [Upstream](https://github.com/lmxxf/antigravity-context-fix)
+- [ARM64 maintenance notes](https://github.com/lmxxf/antigravity-context-fix/blob/main/arm-linux/readme.md)
+- [Original investigation](https://github.com/lmxxf/ai-theorys-study/blob/main/wechat/340-A.md)
+
+Upstream absolute offsets are build-specific. This script relocates functions using Go pclntab and decodes getter field offsets, handling ordinary address movement and changes such as max_token_limit +16 to +12 in 1.4.7. ARM64 model getters support LDR and LDRSW; config exits support both the 1.4.12 and 1.5.0 register layouts.
+
+Future builds are not guaranteed. Symbols, table formats, instruction patterns, model IDs, return conventions and protobuf fields remain assumptions. The ARM64 outer checkpoint pointer currently requires +16. Unsupported changes require code adaptation, not old offsets or removed validation. Structural compatibility is not real-request validation.
+
+Updates overwrite patches. Check first after upgrading, then apply as needed. Hash-specific backups cannot be forced onto a mismatching new build.
+
+## Backups, options and exit codes
+
+Original backups mean exact pre-patch bytes, not authenticated vendor originals. Supported Go stack-check instructions and branch targets are validated, and known partial patches are rejected. This does not authenticate the entire binary or replace vendor signature verification.
+
+Default backup directory: `~/.gemini/agy-patches/` (relative to the Windows user profile there). Original .bak files and JSON manifests contain original / patched hashes and patch locations. Restore verifies a matching current hash and backup hash without requiring patch-parser compatibility, restoring original signature bytes too. Original backups are flushed to disk before replacement; backup directory changes are also persisted on supported platforms.
+
+```bash
+python3 fix_antigravity_context.py --restore --target /actual/path/agy
+python3 fix_antigravity_context.py --restore --backup-dir /backups --target /actual/path/agy
+python3 fix_antigravity_context.py --status --json-out report.json
+```
+
+| Option | Purpose |
+|---|---|
+| No flags | Discover, inspect, confirm and patch original targets |
+| --status / --check / --dry-run | Inspect only |
+| --target PATH | Repeatable explicit targets; replaces discovery |
+| --conversation-id UUID / --db PATH | Choose one precise session |
+| --restore | Verify backups, confirm and restore; --json-out includes before/after hashes and backup source |
+| --backup-dir PATH | Custom backup / manifest directory; also required on restore if customized |
+| --json-out PATH | Inspection / operation JSON report; requires a new filename and rejects backup-directory / protected file types |
+| --kill | Opt-in termination of selected backend names after confirmation |
+
+Inspection exits 0 if all selected binaries match, 2 if none found or any incompatible; session limits do not affect that code. Verification exits 0 on acceptance, 1 on limit mismatch, 2 on unavailable data. Restore and read-only modes cannot be combined. No unattended confirmation bypass is provided.
+
+## Validation and tests
+
+See the opening table for validation on actual installations; a new request on that Mac recorded **983040** in both gen and executor metadata. agy 1.5.0 ARM64 also passed temporary-copy patching, macOS signing and exact restoration, and the patch has been applied locally; a new session after patching recorded **983040** for both request and executor limits. Development tests also cover repeated runs, error handling and simulated discovery layouts for all three systems. No over-256K long-session stress test or all-model validation was performed.
+
+```bash
+python3 -m unittest -v test_regressions test_status test_macos
+# Optional macOS copy-only integration; supply an original binary / backup
+AGY_TEST_BINARY=/path/original.bak python3 -m unittest -v test_macos
+```
+
+## Scope
+
+Do not commit proprietary executables, backups or conversation databases. These are unofficial local-client modifications, not authentication, billing or server-quota bypasses. They do not expand server capabilities. Keep backups and verify actual requests.

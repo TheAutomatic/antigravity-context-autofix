@@ -2,91 +2,167 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-Antigravity（IDE / 桌面端 / `agy` CLI）1M 上下文窗口与 `AGENTS.md` 规则预算的**跨版本自动定位与一键修复脚本**。零第三方依赖（仅需 Python 3 标准库），不分发任何专有二进制文件。
+修复 Antigravity 本地后端的 Argon High / Medium / Low 上下文窗口限制，目标实际请求窗口为 **983040 tokens**，并调整自动 checkpoint 和规则读取预算。同一份 Python 脚本提供自动发现、适配检查、上下文查询、确认后备份修改，以及原版恢复。仅需 **Python 3.9+ 标准库**，不分发专有二进制。
 
----
+## 预期适用范围
 
-## 致谢与原理说明
+| 系统 | 后端架构 / 格式 | 预期适用客户端 | 验证情况 |
+|---|---|---|---|
+| Windows | x86_64 / PE | Antigravity IDE、Antigravity Desktop、agy CLI | 已实现补丁支持；当前版本未完成 Windows 实机验证 |
+| Windows | ARM64 / PE | 暂不列入预期范围 | 未验证，不保证适配 |
+| Linux | x86_64 / ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
+| Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
+| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE 2.6.0 / agy 1.4.12 已实测修改、签名、启动与新请求窗口 |
+| macOS | x86_64（Intel）或 Universal Mach-O | 暂不支持 | 解析器只支持薄格式 ARM64 Mach-O |
 
-- 特别感谢 **[@lmxxf](https://github.com/lmxxf)** 的排查与分享。
-- 同时感谢 **Antigravity IDE**（本仓库的 Windows 架构梳理、Go `pclntab` 跨版本自动定位脚本编写与端到端验库，均由运行在 Antigravity IDE 中的 Agent 协作完成）。
+适用与否以本机后端的结构检查结果为准，不能保证所有版本。多个客户端可能共用同一份后端；本机 Mac 的 IDE 与 CLI 共用 `~/.gemini/bin/agy`，修改后需重启对应客户端。表中的客户端是预期范围，不代表每种安装布局均已实测。
 
-关于为什么 Antigravity 面板显示 1M 窗口但实际在 256K 就会丢历史、以及为什么大体积 `AGENTS.md` 会被截断或整份排除的完整排查过程与底层原理，请直接阅读 [@lmxxf](https://github.com/lmxxf) 的原仓库与文章：
-- 原仓库：[https://github.com/lmxxf/antigravity-context-fix](https://github.com/lmxxf/antigravity-context-fix)
-- 排查原文：[公众号 340-A 记录](https://github.com/lmxxf/ai-theorys-study/blob/main/wechat/340-A.md)
+## 如何运行
 
-**本项目在此基础上做了什么：**
-原仓库针对 Linux 版 `agy` 提供了特定版本的固定偏移补丁与归档。本项目将其做成了一个**跨平台、跨版本的纯脚本自动定位器（Autofix）**：
-- 直接解析可执行文件的 Go `pclntab` 符号表与 getter 指令，自动算出新版函数偏移与结构体字段偏移，**客户端自动升级后无需等待人工重定位，重跑一次脚本即可**；
-- 除 Linux (`x86_64` / `ARM64`) 的 `agy` CLI 外，新增支持 **Windows (`x86_64` PE)** 下的 **Antigravity IDE**、**`agy` CLI** 以及 **Antigravity 独立桌面端**（自动发现并同步更新 `agy.version.json` 缓存元数据）。
-
-**修改内容摘要（与上游方案一致）：**
-1. 将 Gemini 4 Argon（High / Medium / Low 三档）最终配置合并出口的 `max_token_limit` 设为 `1,000,000`（数据库实际请求上限为 **`983,040` tokens**）；
-2. 关闭自动 Checkpoint 提前裁剪（返回 `false, nil`），借用其不可达函数体放置跳板，保持文件大小不变；
-3. 单文件规则/技能读取上限：`24,000` → `1,048,576` 字节（1 MiB）；
-4. Rules / Customizations 两项总预算：`20,000` → `131,072` tokens。
-
----
-
-## 支持的目标程序
-
-- **Windows (`x86_64` PE)**（脚本默认自动扫描以下两处）：
-  - `C:\Users\<User>\.gemini\bin\agy.exe`（**Antigravity IDE** 与 **`agy` CLI** 共用的后端）
-  - `C:\Users\<User>\AppData\Local\Programs\antigravity\resources\bin\language_server.exe`（**Antigravity 独立桌面端** 后端）
-- **Linux (`x86_64` / `ARM64` ELF)**：
-  - `~/.local/bin/agy` 或 `~/.gemini/bin/agy`
-
----
-
-## 快速使用
-
-### Windows（双击或命令行）
-
-1. **只读检查当前状态（无需关闭 IDE）**：
-   双击 `check-status.cmd`，或运行：
-   ```powershell
-   python fix_antigravity_context.py --check
-   ```
-
-2. **一键定位并打补丁（每次客户端升级后重跑一次即可）**：
-   先关闭 Antigravity IDE / 桌面端窗口，然后双击 `fix-all.cmd`，或运行：
-   ```powershell
-   python fix_antigravity_context.py --kill
-   ```
-   > 原版会自动备份到 `C:\Users\<User>\.gemini\agy-patches\`，重启客户端即可生效。
-
-3. **验证当前会话数据库是否已变为 `983040`**：
-   双击 `verify-latest.cmd`，或运行：
-   ```powershell
-   python verify_session.py
-   ```
-
-4. **一键还原原版**：
-   双击 `restore-all.cmd`，或运行：
-   ```powershell
-   python fix_antigravity_context.py --kill --restore
-   ```
-
-### Linux (`x86_64` / `ARM64`)
+进入仓库目录执行。Windows 用 `python`，macOS / Linux 用 `python3`。
 
 ```bash
-# 只读检查
-python3 fix_antigravity_context.py --check --target ~/.local/bin/agy
+# 只检查：发现安装、检查适配、查询 IDE / CLI 最近会话
+python3 fix_antigravity_context.py --status
 
-# 自动定位并打补丁
-python3 fix_antigravity_context.py --target ~/.local/bin/agy
+# 正式运行：先汇总目标，只有输入 Y 才备份并修改
+python3 fix_antigravity_context.py
 
-# 验证会话数据库
-python3 verify_session.py <conversation_id> --agents /path/to/AGENTS.md
-
-# 还原原版
-python3 fix_antigravity_context.py --restore --target ~/.local/bin/agy
+# 恢复：先核验匹配备份，再输入 Y 恢复原始字节
+python3 fix_antigravity_context.py --restore
 ```
 
----
+也可用脚本绝对路径从任意目录运行：
 
-## 合规与免责声明（Disclaimer）
+```bash
+python3 /你的路径/antigravity-context-autofix/fix_antigravity_context.py --status
+```
 
-1. **不分发任何专有二进制文件**：本仓库仅包含原创的 Python 标准库脚本与批处理包装器，**不包含、亦不分发**任何 Google Antigravity（`agy` / `language_server`）可执行文件或其压缩包。请勿将任何 `.exe`、`agy.gz` 或 `.bak` 二进制文件提交至版本控制。
-2. **不涉及鉴权、计费与服务端配额绕过**：本工具不会修改或绕过任何账号登录认证（OAuth）、权限校验、安全沙箱或服务端速率/配额限制；仅用于修正本地客户端在合并配置时将前端已公示的 1.0M 上下文窗口回退为 256K 的问题，以及调整本地工作区规则文件（`AGENTS.md`）的读取截断阈值。
-3. **风险自担**：修改本地客户端二进制属于非官方行为，可能随上游更新而失效。本仓库仅供个人技术研究、调试与互操作性学习使用，使用本脚本产生的一切后果由使用者自行承担。
+Windows 可双击 `check-status.cmd`、`fix-all.cmd`、`restore-all.cmd`、`verify-latest.cmd`。包装器默认不终止进程。
+
+## 执行流程
+
+1. 发现当前用户默认位置、PATH 和已知应用目录的后端，解析符号链接并按真实路径去重。
+2. 逐个显示路径、格式、架构、SHA256、补丁状态及是否兼容。
+3. 分别查询 IDE / CLI 各自最近活跃的数据库（同时考虑主文件和 -wal 修改时间），显示实际请求上限与 executor 配置上限。不启动模型、不发送请求。
+4. 修改模式下，存在不兼容或部分修改的目标时停止，不修改任何目标；可用 `--target` 只选择确认过的目标。恢复模式独立核验当前文件与备份哈希，不要求通过补丁适配检查。
+5. 列出实际待修改或恢复的路径与备份目录，询问 `Continue? [y/N]`。只有明确输入 Y 才继续；回车、其他输入或无交互输入均取消。全部已修补则报告无需修改。
+6. 检查同名后端进程，显示名称和 PID。关闭 IDE / CLI 后输入 Y 重查，仍占用则继续提示，其他输入取消。默认不杀进程。
+7. 备份原版并核验 SHA256，在临时文件上应用补丁；Mac 自动签名并校验，记录签名后的最终哈希。替换前再次检查进程和目标哈希，避免自动升级造成误写。
+8. 原子替换、更新 `agy.version.json` 缓存并复查补丁。各目标独立处理；多目标中途失败时，已完成的目标保留备份，不自动全部回滚。
+
+`--status`、`--check`、`--dry-run` 等效，只查询、不询问、不停止进程、不修改后端。指定 `--json-out` 时会写报告文件；查询可能使用临时只读数据库副本。
+
+Linux 通过 /proc/PID/exe 匹配所选后端真实路径，避免长进程名截断漏检；Windows / macOS 按进程名保守匹配，可能包含另一安装的同名后端。进程检测不是文件锁完整枚举。读取进程列表失败则停止修改。替换遇到占用或目录权限问题，也会提示处理后输入 Y 重试。确需自动终止进程时可使用 `--kill`，仍需先确认操作，且可能影响其他安装的同名后端。
+
+## 如何发现安装位置
+
+所有系统先检查当前用户主目录下的 .gemini/bin、.local/bin 及 PATH，再检查以下目录中名称含 Antigravity 的产品：
+
+- Windows：LOCALAPPDATA/Programs、ProgramFiles、ProgramFiles(x86)。
+- macOS：/Applications、~/Applications。
+- Linux：/opt、/usr/share、/usr/lib、~/.local/share。
+
+应用内只检查已知 bin、resources/bin、resources/app/bin、扩展 bin 等位置；macOS 对应 Contents/Resources。候选文件名包括 agy、language_server 及已知平台后缀名称。
+
+**不是全盘扫描，不查其他用户。** 自定义目录、便携安装、容器、远端主机或未知布局可能漏掉，使用 `--target` 补充。该参数替代自动发现，可重复：
+
+```bash
+python3 fix_antigravity_context.py --status --target /实际路径/agy
+python3 fix_antigravity_context.py --target /路径一/agy --target /路径二/language_server
+```
+
+## 状态解读与上下文查询
+
+默认分别查这两个目录各自最近活跃的数据库（同时考虑主文件和 -wal 修改时间）：
+
+- `~/.gemini/antigravity/conversations/*.db`（IDE / 部分桌面会话）
+- `~/.gemini/antigravity-cli/conversations/*.db`（CLI）
+
+会话**不强行关联到某个发现的后端**，可能属于旧版本、另一安装或其他模型。最新空会话、数据库不可读、schema 变化报告 UNKNOWN。protobuf 截断、越界、非法 varint 或字段类型错误同样返回 UNKNOWN，不会验收通过。
+
+| 状态 | 含义 |
+|---|---|
+| UNPATCHED / compatible=True | 当前结构和字节可匹配，尚未修补；出现已知 checkpoint 局部补丁会拒绝修改 |
+| ALREADY_PATCHED / compatible=True | 磁盘已包含补丁，不代表运行中的进程已重启 |
+| UNSUPPORTED_OR_UNRECOGNIZED | 当前脚本无法匹配文件格式、符号或指令 |
+| UNKNOWN_OR_PARTIAL | 不能认定为完整原版或完整补丁，拒绝打补丁；恢复仍可按哈希核验 |
+| LIMITED_256K | 历史请求的 gen / executor 均为 256000 |
+| EXPECTED_WINDOW | 两处均为 983040 |
+| MIXED_LIMITS / OTHER_WINDOW | 两处不一致或其他窗口，结合模型排查 |
+| UNKNOWN | 数据不足，不能推断锁在256K或已解锁 |
+
+修改后重开 IDE / CLI，用 **Argon High / Medium / Low** 发新请求，再查对应会话：
+
+```bash
+python3 fix_antigravity_context.py --status --conversation-id <会话UUID>
+python3 fix_antigravity_context.py --status --db /实际路径/session.db
+
+# 查询上下文 JSON：latest_limit_ok 应为 true
+python3 verify_session.py <会话UUID>
+python3 verify_session.py --db /实际路径/session.db
+```
+
+记录的请求窗口不等于未来请求、所有模型或超过256K的历史保留效果。切换模型后再查；已丢失/已摘要的历史不会恢复。脚本不自动发送测试请求。
+
+## 修改内容与 Mac 签名
+
+- Argon High / Medium / Low（当前编号1417/1418/1419）最终配置出口写入 `max_token_limit=1000000`；当前实测实际请求窗口 **983040**。
+- 自动 checkpoint 判断返回 `(false, nil)`，借不可达函数体放跳板。这不等于关闭所有裁剪，手动 compact 未验证。
+- 规则 / skill 单文件读取上限从24000字节提高到 **1 MiB**。
+- Rules / Customizations 总预算从20000各提高到 **131072 tokens**。规则和 checkpoint 的修改不限于三档窗口选择条件。
+
+代码补丁保持长度；Mac 签名可能改变最终大小。使用系统 `codesign --force --sign -` 做本地 ad-hoc 签名，无需证书；签名和补丁校验通过才替换。不保留原厂开发者身份/公证信任，不关闭 Gatekeeper 或 SIP。
+
+## 版本适配边界
+
+感谢 [@lmxxf](https://github.com/lmxxf) 的调查与方案，以及 Antigravity IDE 对 Windows 架构梳理、定位脚本和验证的协作贡献。
+
+- [原仓库](https://github.com/lmxxf/antigravity-context-fix)
+- [ARM64 维护说明](https://github.com/lmxxf/antigravity-context-fix/blob/main/arm-linux/readme.md)
+- [原始文章](https://github.com/lmxxf/ai-theorys-study/blob/main/wechat/340-A.md)
+
+上游的绝对地址只适用于对应构建。这里通过 Go pclntab 重找函数、从 getter 解码部分字段，支持普通地址移动，以及1.4.7那类 max_token_limit +16 → +12；ARM64 模型 getter 兼容 LDR / LDRSW，配置出口兼容 1.4.12 与 1.5.0 的两种寄存器布局。
+
+**不保证所有未来版本。** 函数名、Go 表格式、指令模式、模型编号、返回约定及数据库字段仍有假设；ARM64 外层 checkpoint 指针目前要求 +16。变化超出模式时需要适配，不能删除校验或试填旧偏移；结构匹配不能替代真实请求测试。
+
+自动升级会覆盖补丁，升级后先查状态再决定是否重打。备份按构建哈希区分，不把旧备份硬套到新版。
+
+## 备份、参数与退出码
+
+“原版备份”指修改前文件的逐字节备份，不是原厂身份认证。脚本校验已支持的 Go 栈检查入口指令及分支关系，并排除已知部分补丁；无法确认则停止。该检查不能证明整个二进制未被第三方修改，也不能替代厂商签名验证。
+
+备份默认保存到用户主目录 `~/.gemini/agy-patches/`：原版 .bak 与记录原版/修改版 SHA256、补丁位置的 JSON 清单。恢复要求当前哈希匹配清单，并核验备份；不要求当前文件通过补丁适配检查，原始签名字节也会恢复。替换程序前确保原版备份写入磁盘；支持的平台同时保存备份目录变更。
+
+```bash
+python3 fix_antigravity_context.py --restore --target /实际路径/agy
+python3 fix_antigravity_context.py --restore --backup-dir /备份目录 --target /实际路径/agy
+python3 fix_antigravity_context.py --status --json-out report.json
+```
+
+| 参数 | 作用 |
+|---|---|
+| 无参数 | 自动发现、检查，确认后修改未修补目标 |
+| --status / --check / --dry-run | 只检查 |
+| --target PATH | 指定目标，支持重复，替代自动发现 |
+| --conversation-id UUID / --db PATH | 二选一，指定查询会话 |
+| --restore | 核验备份、确认并恢复；与 --json-out 一起使用可输出恢复前后哈希和备份来源 |
+| --backup-dir PATH | 自定义备份与清单目录；恢复时需指定同一目录 |
+| --json-out PATH | 输出本次检查/修改报告；必须使用不存在的新文件，拒绝备份目录及受保护文件类型 |
+| --kill | 可选，确认后终止选中目标的同名后端进程；默认不用，可能影响其他安装的同名进程 |
+
+检查退出码0=全部目标兼容，2=没找到或不兼容；会话窗口不影响此退出码。verify_session.py：0=验收通过，1=窗口未达标，2=无法读取数据。恢复和只读模式不能混用，没有跳过 Y 确认的无人值守选项。
+
+## 验证与测试
+
+实机验证范围见开头表格；该 Mac 的新请求 gen / executor 均记录为 **983040**。agy 1.5.0 ARM64 已通过临时副本修改、Mac 签名与精确恢复，并已应用到本机；修改后新会话的 request / executor 均验证为 **983040**。开发测试另覆盖重复运行、异常处理及三系统发现布局模拟。未做超过256K长会话压力测试或全部模型验证。
+
+```bash
+python3 -m unittest -v test_regressions test_status test_macos
+# Mac 可选集成：只修改临时副本，提供未修补原版或原版备份
+AGY_TEST_BINARY=/路径/原版备份.bak python3 -m unittest -v test_macos
+```
+
+## 使用边界
+
+本仓库不分发 Google 专有程序，不要提交可执行文件、备份或数据库。属于非官方本地客户端修改，不涉及鉴权、计费或服务端配额绕过；不提高服务端能力。保留备份，效果以实际请求与使用验证为准。
