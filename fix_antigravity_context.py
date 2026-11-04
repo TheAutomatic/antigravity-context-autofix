@@ -238,12 +238,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     b_apply = fbytes("applyOverride")
     f_apply = funcs["applyOverride"]
     tail_idx = b_apply.find(b"\x31\xc9\xc9\xc3")
-    if tail_idx < 6 or b_apply.find(b"\x31\xc9\xc9\xc3", tail_idx + 1) != -1:
+    if tail_idx < 9 or b_apply.find(b"\x31\xc9\xc9\xc3", tail_idx + 1) != -1:
         raise RuntimeError("Could not uniquely locate epilogue (31 c9 c9 c3) in applyFeatureProviderCheckpointOverrideConfig")
-    exit_rel = tail_idx - 6
-    exit_va = f_apply["va_start"] + exit_rel
-    exit_foff = f_apply["file_start"] + exit_rel
-    exit_cur = b_apply[exit_rel : exit_rel + 6]
 
     f_chk = funcs["checkpointNeeded"]
     if f_chk["file_end"] - f_chk["file_start"] < 128:
@@ -253,38 +249,81 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     tramp_va = chk_va + 0x20
     tramp_foff = chk_foff + 0x20
 
-    if exit_cur[:3] == b"\x48\x89\x48" and exit_cur[4:6] == b"\x31\xdb":
-        checkpoint_off = exit_cur[3]
-    else:
-        tramp_done = data[tramp_foff + 35 : tramp_foff + 41]
-        if tramp_done[:3] == b"\x48\x89\x48" and tramp_done[4:6] == b"\x31\xdb":
-            checkpoint_off = tramp_done[3]
-        else:
-            raise RuntimeError(f"Unrecognized instruction sequence at applyOverride exit: {exit_cur.hex()}")
+    # Supported compiler layouts for the final checkpoint store before epilogue:
+    # - layout A (<=1.4.12 / language_server): mov [rax + off], rcx; xor ebx, ebx (6 bytes at tail_idx - 6)
+    #   where rax = config, rcx = checkpoint
+    # - layout B (1.5.0+ agy): mov [rdx + off], rax; mov rax, rdx; xor ebx, ebx (9 bytes at tail_idx - 9)
+    #   where rdx = config, rax = checkpoint (copied rdx->rax right after store)
+    exit_rel_a = tail_idx - 6
+    exit_cur_a = b_apply[exit_rel_a : exit_rel_a + 6]
+    exit_rel_b = tail_idx - 9
+    exit_cur_b = b_apply[exit_rel_b : exit_rel_b + 9]
+    tramp_done = data[tramp_foff + 35 : tramp_foff + 41]
 
-    exit_before = bytes([0x48, 0x89, 0x48, checkpoint_off, 0x31, 0xDB])
+    if exit_cur_a[:3] == b"\x48\x89\x48" and exit_cur_a[4:6] == b"\x31\xdb":
+        exit_layout = "rax_rcx"
+        checkpoint_off = exit_cur_a[3]
+        exit_rel = exit_rel_a
+    elif exit_cur_b[:3] == b"\x48\x89\x42" and exit_cur_b[4:9] == b"\x48\x89\xd0\x31\xdb":
+        exit_layout = "rdx_rax"
+        checkpoint_off = exit_cur_b[3]
+        exit_rel = exit_rel_b
+    elif tramp_done[:3] == b"\x48\x89\x48" and tramp_done[4:6] == b"\x31\xdb" and exit_cur_a[0] == 0xE9 and exit_cur_a[5] == 0x90:
+        exit_layout = "rax_rcx"
+        checkpoint_off = tramp_done[3]
+        exit_rel = exit_rel_a
+    elif tramp_done[:3] == b"\x48\x89\x42" and tramp_done[4:6] == b"\x31\xdb" and exit_cur_b[0] == 0xE9 and exit_cur_b[5:9] == b"\x90\x48\x89\xd0":
+        exit_layout = "rdx_rax"
+        checkpoint_off = tramp_done[3]
+        exit_rel = exit_rel_b
+    else:
+        raise RuntimeError(f"Unrecognized instruction sequence at applyOverride exit: {exit_cur_b.hex()}")
+
+    exit_va = f_apply["va_start"] + exit_rel
+    exit_foff = f_apply["file_start"] + exit_rel
     jmp_to_tramp_rel = tramp_va - (exit_va + 5)
     if not (-0x80000000 <= jmp_to_tramp_rel <= 0x7FFFFFFF):
         raise RuntimeError("Trampoline is out of 32-bit relative jump range")
-    exit_after = b"\xe9" + struct.pack("<i", jmp_to_tramp_rel) + b"\x90"
-
     jmp_back_rel = (exit_va + 6) - (tramp_va + 46)
-    tramp_after = (
-        b"\x48\x85\xc9"                                  # test rcx, rcx
-        b"\x74\x1e"                                      # je .done (+30 -> 35)
-        + bytes([0x48, 0x8B, 0x50, planner_off])         # mov rdx, [rax + planner_off]
-        + b"\x48\x85\xd2"                                # test rdx, rdx
-        + b"\x74\x15"                                    # je .done (+21 -> 35)
-        + bytes([0x8B, 0x52, plan_model_off])            # mov edx, [rdx + plan_model_off]
-        + b"\x81\xea\x89\x05\x00\x00"                    # sub edx, 1417
-        + b"\x83\xfa\x02"                                # cmp edx, 2
-        + b"\x77\x07"                                    # ja .done (+7 -> 35)
-        + bytes([0xC7, 0x41, max_limit_off])             # mov dword ptr [rcx + max_limit_off], 1000000
-        + struct.pack("<I", 1000000)
-        + bytes([0x48, 0x89, 0x48, checkpoint_off])      # .done: mov [rax + checkpoint_off], rcx
-        + b"\x31\xdb"                                    # xor ebx, ebx
-        + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6)
-    )
+
+    if exit_layout == "rax_rcx":
+        exit_before = bytes([0x48, 0x89, 0x48, checkpoint_off, 0x31, 0xDB])
+        exit_after = b"\xe9" + struct.pack("<i", jmp_to_tramp_rel) + b"\x90"
+        tramp_after = (
+            b"\x48\x85\xc9"                                  # test rcx, rcx
+            b"\x74\x1e"                                      # je .done (+30 -> 35)
+            + bytes([0x48, 0x8B, 0x50, planner_off])         # mov rdx, [rax + planner_off]
+            + b"\x48\x85\xd2"                                # test rdx, rdx
+            + b"\x74\x15"                                    # je .done (+21 -> 35)
+            + bytes([0x8B, 0x52, plan_model_off])            # mov edx, [rdx + plan_model_off]
+            + b"\x81\xea\x89\x05\x00\x00"                    # sub edx, 1417
+            + b"\x83\xfa\x02"                                # cmp edx, 2
+            + b"\x77\x07"                                    # ja .done (+7 -> 35)
+            + bytes([0xC7, 0x41, max_limit_off])             # mov dword ptr [rcx + max_limit_off], 1000000
+            + struct.pack("<I", 1000000)
+            + bytes([0x48, 0x89, 0x48, checkpoint_off])      # .done: mov [rax + checkpoint_off], rcx
+            + b"\x31\xdb"                                    # xor ebx, ebx
+            + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6)
+        )
+    else:
+        exit_before = bytes([0x48, 0x89, 0x42, checkpoint_off, 0x48, 0x89, 0xD0, 0x31, 0xDB])
+        exit_after = b"\xe9" + struct.pack("<i", jmp_to_tramp_rel) + b"\x90\x48\x89\xd0"
+        tramp_after = (
+            b"\x48\x85\xc0"                                  # test rax, rax
+            b"\x74\x1e"                                      # je .done (+30 -> 35)
+            + bytes([0x48, 0x8B, 0x4A, planner_off])         # mov rcx, [rdx + planner_off]
+            + b"\x48\x85\xc9"                                # test rcx, rcx
+            + b"\x74\x15"                                    # je .done (+21 -> 35)
+            + bytes([0x8B, 0x49, plan_model_off])            # mov ecx, [rcx + plan_model_off]
+            + b"\x81\xe9\x89\x05\x00\x00"                    # sub ecx, 1417
+            + b"\x83\xf9\x02"                                # cmp ecx, 2
+            + b"\x77\x07"                                    # ja .done (+7 -> 35)
+            + bytes([0xC7, 0x40, max_limit_off])             # mov dword ptr [rax + max_limit_off], 1000000
+            + struct.pack("<I", 1000000)
+            + bytes([0x48, 0x89, 0x42, checkpoint_off])      # .done: mov [rdx + checkpoint_off], rax
+            + b"\x31\xdb"                                    # xor ebx, ebx
+            + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6 -> mov rax, rdx)
+        )
     assert len(tramp_after) == 46
     chk_entry_after = b"\x31\xc0\x31\xdb\x31\xc9\xc3"
 
@@ -304,34 +343,64 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     # 4. Aggregate token budgets: 20000 -> 131072
     fb_trunc = fbytes("computeTruncated")
     f_trunc = funcs["computeTruncated"]
-    idx_r9 = fb_trunc.find(b"\x41\xb9\x20\x4e\x00\x00")
-    idx_edx = fb_trunc.find(b"\xba\x20\x4e\x00\x00")
-    if idx_r9 == -1 or idx_edx == -1:
+    r9_zero_before = b"\x41\xb9\x00\x00\x00\x00"
+    r9_def_before = b"\x41\xb9\x20\x4e\x00\x00"
+    r9_after = b"\x41\xb9\x00\x00\x02\x00"
+    edx_zero_before = b"\x31\xd2\xeb\x05\xba\x20\x4e\x00\x00"
+    edx_after = b"\xba\x00\x00\x02\x00\x66\x0f\x1f\x00"
+
+    r9_pair_idxs = [
+        i for i in range(len(fb_trunc) - 17)
+        if fb_trunc[i : i + 6] in (r9_zero_before, r9_after)
+        and fb_trunc[i + 6 : i + 11] == b"\xeb\x09\x48\x85\xd2"
+        and fb_trunc[i + 11 : i + 17] in (r9_def_before, r9_after)
+    ]
+    edx_idxs = [
+        i for i in range(len(fb_trunc) - 9)
+        if fb_trunc[i : i + 9] in (edx_zero_before, edx_after)
+    ]
+    if len(r9_pair_idxs) != 1 or len(edx_idxs) != 1:
         raise RuntimeError("Could not find 0x4e20 default assignments in computeTruncatedCustomizations")
-    store_r9 = fb_trunc.find(b"\x44\x89\x8c\x24", idx_r9, idx_r9 + 128)
-    store_edx = fb_trunc.find(b"\x89\x94\x24", idx_edx, idx_edx + 64)
-    if store_r9 == -1 or store_edx == -1:
-        raise RuntimeError("Could not find stack slot stores for rules/customizations budgets")
-    disp_a = fb_trunc[store_r9 + 4 : store_r9 + 8]
-    disp_b = fb_trunc[store_edx + 3 : store_edx + 7]
+    r9_rel = r9_pair_idxs[0]
+    idx_r9 = r9_rel + 11
+    edx_rel = edx_idxs[0]
+    idx_edx = edx_rel + 4
 
-    budget1_before = b"\x8b\x9c\x24" + disp_b
-    budget1_after = b"\xbb\x00\x00\x02\x00\x66\x90"
-    budget2_before = b"\x8b\x84\x24" + disp_a
-    budget2_after = b"\xb8\x00\x00\x02\x00\x66\x90"
-
-    call_matches = []
-    for i in range(len(fb_trunc) - 18):
-        if (
-            fb_trunc[i : i + 7] in (budget1_before, budget1_after)
+    store_r9_disp32 = fb_trunc.find(b"\x44\x89\x8c\x24", idx_r9, idx_r9 + 128)
+    store_edx_disp32 = fb_trunc.find(b"\x89\x94\x24", idx_edx, idx_edx + 64)
+    store_r9_disp8 = fb_trunc.find(b"\x44\x89\x4c\x24", idx_r9, idx_r9 + 128)
+    store_edx_disp8 = fb_trunc.find(b"\x89\x54\x24", idx_edx, idx_edx + 64)
+    if store_r9_disp32 != -1 and store_edx_disp32 != -1:
+        disp_a = fb_trunc[store_r9_disp32 + 4 : store_r9_disp32 + 8]
+        disp_b = fb_trunc[store_edx_disp32 + 3 : store_edx_disp32 + 7]
+        budget1_before = b"\x8b\x9c\x24" + disp_b
+        budget1_after = b"\xbb\x00\x00\x02\x00\x66\x90"
+        budget2_before = b"\x8b\x84\x24" + disp_a
+        budget2_after = b"\xb8\x00\x00\x02\x00\x66\x90"
+        call_matches = [
+            i for i in range(len(fb_trunc) - 18)
+            if fb_trunc[i : i + 7] in (budget1_before, budget1_after)
             and fb_trunc[i + 7 : i + 10] == b"\x48\x89\xc1"
             and fb_trunc[i + 10 : i + 17] in (budget2_before, budget2_after)
             and fb_trunc[i + 17] == 0xE8
-        ):
-            call_matches.append(i)
-    if len(call_matches) != 1:
-        raise RuntimeError(f"Expected 1 budget call-site match in computeTruncatedCustomizations, found {len(call_matches)}")
-    c_rel = call_matches[0]
+        ]
+        if len(call_matches) != 1:
+            raise RuntimeError(f"Expected 1 budget call-site match in computeTruncatedCustomizations, found {len(call_matches)}")
+        c_rel = call_matches[0]
+        budget_sites = [
+            ("customizations_budget", "customizations token budget -> 131072", c_rel, budget1_before, budget1_after),
+            ("rules_budget", "rules token budget -> 131072", c_rel + 10, budget2_before, budget2_after),
+        ]
+    elif store_r9_disp8 != -1 and store_edx_disp8 != -1:
+        # In 1.5.0+, the stack slots use disp8 (4-byte movs before the call), so a 5-byte mov reg, 0x20000
+        # cannot fit in-place at the call site; instead, patch the two 0/20000 immediate loads into r9d and edx.
+        budget_sites = [
+            ("rules_budget_zero", "rules token budget (zero fallback) -> 131072", r9_rel, r9_zero_before, r9_after),
+            ("rules_budget_default", "rules token budget (default 20000) -> 131072", idx_r9, r9_def_before, r9_after),
+            ("customizations_budget", "customizations token budget -> 131072", edx_rel, edx_zero_before, edx_after),
+        ]
+    else:
+        raise RuntimeError("Could not find stack slot stores for rules/customizations budgets")
 
     changes = [
         {
@@ -372,24 +441,16 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             "after": b_aft.hex(),
             "fixed_before": True,
         })
-    changes.append({
-        "name": "customizations_budget",
-        "purpose": "computeTruncatedCustomizations: customizations token budget -> 131072",
-        "va": hex(f_trunc["va_start"] + c_rel),
-        "offset": hex(f_trunc["file_start"] + c_rel),
-        "before": budget1_before.hex(),
-        "after": budget1_after.hex(),
-        "fixed_before": True,
-    })
-    changes.append({
-        "name": "rules_budget",
-        "purpose": "computeTruncatedCustomizations: rules token budget -> 131072",
-        "va": hex(f_trunc["va_start"] + c_rel + 10),
-        "offset": hex(f_trunc["file_start"] + c_rel + 10),
-        "before": budget2_before.hex(),
-        "after": budget2_after.hex(),
-        "fixed_before": True,
-    })
+    for b_name, b_desc, b_rel, b_bef, b_aft in budget_sites:
+        changes.append({
+            "name": b_name,
+            "purpose": f"computeTruncatedCustomizations: {b_desc}",
+            "va": hex(f_trunc["va_start"] + b_rel),
+            "offset": hex(f_trunc["file_start"] + b_rel),
+            "before": b_bef.hex(),
+            "after": b_aft.hex(),
+            "fixed_before": True,
+        })
     return {
         "field_offsets": {
             "planner": planner_off,
@@ -917,7 +978,7 @@ def running_backends(targets):
                 if any(n[:15] == name for n in names):
                     raise RuntimeError(f"Cannot inspect possible backend PID={directory.name} name={name}")
                 continue
-            if executable in selected:
+            if executable in selected or str(Path(executable).resolve()) in selected:
                 found.append({"pid": int(directory.name), "name": Path(executable).name})
         return found
     if os.name == "nt":
@@ -1015,6 +1076,60 @@ def inspect_contexts(conversation_id=None, db_path=None):
     return reports
 
 
+def _ensure_utf8_stdio():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _enable_ansi() -> bool:
+    _ensure_utf8_stdio()
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_ulong()
+            if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+                return bool(os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"))
+            if not (mode.value & 0x0004):
+                if not k32.SetConsoleMode(h, mode.value | 0x0004):
+                    return False
+            return True
+        except Exception:
+            return False
+    return True
+
+
+def _style(text: str, code: str, enabled: bool) -> str:
+    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+
+def _backend_role(path_str: str) -> str:
+    low = path_str.lower().replace("\\", "/")
+    if "language_server" in Path(path_str).name.lower():
+        return "Desktop App"
+    if "/.gemini/bin/" in low:
+        return "IDE / CLI"
+    return "CLI / Backend"
+
+
+def _short_db_label(session: dict) -> str:
+    src = Path(session.get("source", "")).parent.name or "session"
+    if "db_path" in session:
+        stem = Path(session["db_path"]).stem
+        short_id = f"{stem[:8]}..{stem[-4:]}" if len(stem) > 14 else stem
+        return f"{src} ({short_id})"
+    return src
+
+
 def preflight(targets, conversation_id=None, db_path=None):
     binaries = []
     for target in targets:
@@ -1030,30 +1145,82 @@ def preflight(targets, conversation_id=None, db_path=None):
     sessions = inspect_contexts(conversation_id, db_path)
     report = {"binaries": binaries, "compatible": compatible, "sessions": sessions,
               "session": max(sessions, key=lambda s: s.get("recorded_at", 0))}
-    print("\n=== Read-only preflight / 运行前检查 ===")
-    for info in binaries:
-        print(f"Binary : {info['path']}")
-        print(f"Status : {info['status']} | compatible={info['compatible']}")
-        if "error" in info:
-            print(f"Reason : {info['error']}")
-        else:
-            print(f"Format : {info['format']} {info['arch']} | sites={len(info['changes'])}")
-            print(f"SHA256 : {info['sha256']}")
-            print(f"Fields : {info['field_offsets']}")
+
+    c_on = _enable_ansi()
+    bar = "=" * 72
+    sep = "-" * 72
+    print("\n" + _style(bar, "1;36", c_on))
+    print(_style("  Antigravity 1M Context Patcher  |  预检报告 / Preflight Check", "1", c_on))
+    print(_style(bar, "1;36", c_on))
+
+    print("\n  " + _style("[1] 后端程序 / Backend Binaries", "1", c_on))
+    print("  " + _style(sep[:68], "2", c_on))
     if not binaries:
-        print("Binary : NOT_FOUND; specify --target <backend path>")
-    for session in sessions:
-        print(f"Context: {session['state']}")
-        if "source" in session:
-            print(f"Source : {session['source']}")
-        if "latest_turn" in session:
-            latest = session["latest_turn"]
-            print(f"DB     : {session['db_path']}")
-            print(f"Limits : request={latest['gen_max_context_tokens']}, executor={latest['executor_max_token_limit']}")
-            print(f"Turns  : gen={latest['gen_idx']}, executor={latest['executor_idx']}")
+        print("  " + _style("[✗ 未找到 / NOT FOUND]", "1;31", c_on) + " 请通过 --target <path> 指定路径 / Specify --target <path>")
+    for idx, info in enumerate(binaries, 1):
+        p_obj = Path(info["path"])
+        role = _backend_role(info["path"])
+        st = info["status"]
+        if st == "ALREADY_PATCHED":
+            st_badge = _style("[✓ 已打补丁 / ALREADY_PATCHED]", "1;32", c_on)
+            compat_badge = _style("[✓ 兼容 / Compatible]", "32", c_on)
+        elif st == "UNPATCHED":
+            st_badge = _style("[● 未打补丁 / UNPATCHED]", "1;33", c_on)
+            compat_badge = _style("[✓ 可打补丁 / Ready to Patch]", "1;32", c_on)
         else:
-            print(f"Reason : {session['error']}")
-    print("Note   : Stored requests are not mapped to a particular binary. They do not prove the current model/process or long-session retention.")
+            st_badge = _style(f"[✗ 不兼容 / {st}]", "1;31", c_on)
+            compat_badge = _style("[✗ 无法修改 / Incompatible]", "31", c_on)
+
+        meta = ""
+        if "error" not in info:
+            meta = _style(f"({info['format']} {info['arch']}, {len(info['changes'])} sites, sha256:{info['sha256'][:10]}..)", "2", c_on)
+        print(f"  #{idx}  " + _style(p_obj.name, "1", c_on) + f"  [{role}]  {meta}")
+        print(f"      Path   : {info['path']}")
+        print(f"      Status : {st_badge}  {compat_badge}")
+        if "error" in info:
+            print(f"      Reason : " + _style(info["error"], "31", c_on))
+        if idx < len(binaries):
+            print()
+
+    print("\n  " + _style("[2] 最近会话上下文快照 / Recent Session Context (DB Snapshot)", "1", c_on))
+    print("  " + _style(sep[:68], "2", c_on))
+    for session in sessions:
+        st = session["state"]
+        label = _short_db_label(session)
+        if st == "EXPECTED_WINDOW":
+            ctx_badge = _style("[✓ 1M 已生效 / 1M ACTIVE (983K)]", "1;32", c_on)
+        elif st == "LIMITED_256K":
+            ctx_badge = _style("[! 256K 默认限制 / LIMITED_256K]", "1;33", c_on)
+        elif st == "MIXED_LIMITS":
+            ctx_badge = _style("[~ 混合水位 / MIXED_LIMITS]", "1;36", c_on)
+        elif st == "OTHER_WINDOW":
+            ctx_badge = _style("[i 其他模型窗口 / OTHER_WINDOW]", "36", c_on)
+        else:
+            ctx_badge = _style("[? 未知 / UNKNOWN]", "2", c_on)
+
+        if "latest_turn" in session:
+            lt = session["latest_turn"]
+            req_k = f"{lt['gen_max_context_tokens']:,}"
+            exe_k = f"{lt['executor_max_token_limit']:,}"
+            turns = f"turn #{lt['gen_idx']}"
+            print(f"  *   {label:<32} {ctx_badge}")
+            print(f"      Limits : Request={req_k}  |  Executor={exe_k}  ({_style(turns, '2', c_on)})")
+        else:
+            print(f"  *   {label:<32} {ctx_badge}  ({_style(session['error'], '2', c_on)})")
+
+    print("  " + _style("Note: 仅反映历史请求记录；打补丁重启并发送新消息后刷新 / DB reflects past turns only.", "2", c_on))
+
+    unpatched_cnt = sum(1 for b in binaries if b["status"] == "UNPATCHED")
+    patched_cnt = sum(1 for b in binaries if b["status"] == "ALREADY_PATCHED")
+    print("\n" + _style(bar, "1;36", c_on))
+    if not compatible:
+        summary = _style("✗ 存在不兼容的后端，未做任何修改 / Incompatible binary found (no changes made)", "1;31", c_on)
+    elif unpatched_cnt > 0:
+        summary = _style(f"✓ 发现 {unpatched_cnt} 个可打补丁的后端 (已打补丁: {patched_cnt}) / {unpatched_cnt} ready to patch ({patched_cnt} already patched)", "1;32", c_on)
+    else:
+        summary = _style(f"✓ 全部 {patched_cnt} 个后端均已打过补丁 / All {patched_cnt} backend(s) already patched", "1;32", c_on)
+    print(f"  结论 / Summary : {summary}")
+    print(_style(bar, "1;36", c_on))
     return report
 
 
@@ -1142,6 +1309,7 @@ def write_report(path, report):
 
 
 def main():
+    _ensure_utf8_stdio()
     ap = argparse.ArgumentParser(description="Auto-locate (via Go pclntab) and patch Antigravity 1M context & rules budgets.")
     ap.add_argument("--target", type=Path, action="append", help="Path to agy / language_server binary (repeatable). Defaults to auto-discovered installations.")
     ap.add_argument("--check", "--dry-run", dest="dry_run", action="store_true", help="Read-only check: locate symbols, verify patterns, and print patch plan without modifying files.")
