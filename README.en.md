@@ -8,14 +8,24 @@ Patch the local Antigravity backend to raise the Argon High / Medium / Low reque
 
 | System | Backend architecture / format | Intended clients | Validation |
 |---|---|---|---|
-| Windows | x86_64 / PE | Antigravity IDE, Antigravity Desktop, agy CLI | Patch support implemented; current builds have not been tested on a Windows machine |
+| Windows | x86_64 / PE | Antigravity IDE, Antigravity Desktop, agy CLI | Locally verified on IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) and Desktop (`language_server.exe` CL 1009437749 & 1013060670): patching, startup and new request window |
 | Windows | ARM64 / PE | Outside the expected scope for now | Unvalidated; compatibility is not guaranteed |
 | Linux | x86_64 / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
 | Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
-| macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | IDE 2.6.0 / agy 1.4.12 tested locally: patching, signing, startup and a new request window |
+| macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | Locally verified on IDE 2.6.0 / agy 1.4.12 & 1.5.0: patching, signing, startup and new request window |
 | macOS | x86_64 (Intel) or Universal Mach-O | Unsupported | The parser only supports thin ARM64 Mach-O |
 
-Each backend must pass local structural checks; compatibility across all versions is not guaranteed. Multiple clients may share a backend: on the tested Mac, IDE and CLI share `~/.gemini/bin/agy` and must be restarted after patching. Intended clients do not imply that every installation layout has been tested.
+Each backend must pass local structural checks; compatibility across all versions is not guaranteed. Intended clients do not imply that every installation layout has been tested.
+
+### Client architecture (backends vs. conversation databases)
+
+Across Antigravity IDE, Desktop App, and CLI (`agy` / Remote Control), binaries and SQLite conversation stores are cross-shared:
+
+| Client surface | Go backend binary | Conversation DB directory (`*.db`) | Sharing relationship |
+|---|---|---|---|
+| **Antigravity IDE** | `~/.gemini/bin/agy(.exe)` | `~/.gemini/antigravity/conversations` | **Shares backend with CLI** (add `~/.gemini/bin` to `PATH` to avoid a duplicate CLI install) and **shares conversation DBs with Desktop App** |
+| **Antigravity Desktop App** | `<app>/resources/bin/language_server(.exe)` | `~/.gemini/antigravity/conversations` | Uses its own bundled `language_server` binary, but **shares conversation DBs with IDE** (IDE chats appear in Desktop App) |
+| **agy CLI / Remote Control** | `~/.gemini/bin/agy(.exe)` (or standalone `agy`) | `~/.gemini/antigravity-cli/conversations` | **Shares `agy` backend with IDE**, but uses an isolated `antigravity-cli` DB directory (avoiding SQLite lock contention while IDE/App is open) |
 
 ## Run
 
@@ -68,8 +78,8 @@ python3 fix_antigravity_context.py --target /one/agy --target /two/language_serv
 
 The latest active DB from each directory is reported separately, considering both the database and its -wal modification time:
 
-- `~/.gemini/antigravity/conversations/*.db` (IDE / some desktop sessions)
-- `~/.gemini/antigravity-cli/conversations/*.db` (CLI)
+- `~/.gemini/antigravity/conversations/*.db` (shared by Antigravity IDE and Antigravity Desktop App)
+- `~/.gemini/antigravity-cli/conversations/*.db` (used by `agy` CLI and Remote Control daemon)
 
 These databases are not mapped to a particular discovered executable. They may belong to an older build, another install or another model. Empty, unreadable or changed-schema databases produce UNKNOWN. Truncated protobuf fields, overflowed varints and wrong wire types also fail parsing instead of passing acceptance.
 
@@ -112,7 +122,7 @@ Thanks to [@lmxxf](https://github.com/lmxxf) for the investigation and patch str
 - [ARM64 maintenance notes](https://github.com/lmxxf/antigravity-context-fix/blob/main/arm-linux/readme.md)
 - [Original investigation](https://github.com/lmxxf/ai-theorys-study/blob/main/wechat/340-A.md)
 
-Upstream absolute offsets are build-specific. This script relocates functions using Go pclntab and decodes getter field offsets, handling ordinary address movement and changes such as max_token_limit +16 to +12 in 1.4.7. ARM64 model getters support LDR and LDRSW; config exits support both the 1.4.12 and 1.5.0 register layouts.
+Upstream absolute offsets are build-specific. This script relocates functions using Go pclntab and decodes getter field offsets, handling ordinary address movement and changes such as max_token_limit +16 to +12 in 1.4.7. ARM64 model getters support LDR and LDRSW; both x86_64 and ARM64 config exits and budget assignments support the 1.4.12 and 1.5.0 compiler layouts.
 
 Future builds are not guaranteed. Symbols, table formats, instruction patterns, model IDs, return conventions and protobuf fields remain assumptions. The ARM64 outer checkpoint pointer currently requires +16. Unsupported changes require code adaptation, not old offsets or removed validation. Structural compatibility is not real-request validation.
 

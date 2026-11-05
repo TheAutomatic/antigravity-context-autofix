@@ -8,14 +8,24 @@
 
 | 系统 | 后端架构 / 格式 | 预期适用客户端 | 验证情况 |
 |---|---|---|---|
-| Windows | x86_64 / PE | Antigravity IDE、Antigravity Desktop、agy CLI | 已实现补丁支持；当前版本未完成 Windows 实机验证 |
+| Windows | x86_64 / PE | Antigravity IDE、Antigravity Desktop、agy CLI | 本机 IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) 与 Desktop (`language_server.exe` CL 1009437749 & 1013060670) 已实测修改、启动与新请求窗口 |
 | Windows | ARM64 / PE | 暂不列入预期范围 | 未验证，不保证适配 |
 | Linux | x86_64 / ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
 | Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
-| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE 2.6.0 / agy 1.4.12 已实测修改、签名、启动与新请求窗口 |
+| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE 2.6.0 / agy 1.4.12 & 1.5.0 已实测修改、签名、启动与新请求窗口 |
 | macOS | x86_64（Intel）或 Universal Mach-O | 暂不支持 | 解析器只支持薄格式 ARM64 Mach-O |
 
-适用与否以本机后端的结构检查结果为准，不能保证所有版本。多个客户端可能共用同一份后端；本机 Mac 的 IDE 与 CLI 共用 `~/.gemini/bin/agy`，修改后需重启对应客户端。表中的客户端是预期范围，不代表每种安装布局均已实测。
+适用与否以本机后端的结构检查结果为准，不能保证所有版本。表中的客户端是预期范围，不代表每种安装布局均已实测。
+
+### 三端架构关系（后端与会话数据库）
+
+Antigravity 的三个客户端（IDE、Desktop App、CLI / Remote Control）在底层采用**“两套后端、两套会话数据库”交叉复用**的设计：
+
+| 客户端形态 | 使用的 Go 后端二进制 | 使用的会话数据库目录 (`*.db`) | 共用关系说明 |
+|---|---|---|---|
+| **Antigravity IDE** | `~/.gemini/bin/agy(.exe)` | `~/.gemini/antigravity/conversations` | **与 CLI 共用后端**（加进 `PATH` 即可免重复安装 CLI），**与 Desktop App 共用会话数据库** |
+| **Antigravity Desktop App** | 安装目录 `resources/bin/language_server(.exe)` | `~/.gemini/antigravity/conversations` | 拥有独立的 `language_server` 后端，但**与 IDE 读写同一个会话数据库**（IDE 里的对话在 App 中直接可见） |
+| **agy CLI / Remote Control** | `~/.gemini/bin/agy(.exe)`（或独立安装的 `agy`） | `~/.gemini/antigravity-cli/conversations` | **与 IDE 共用 `agy` 后端**，但使用独立的 `antigravity-cli` 会话库（避免与正在运行的 IDE / App 发生 SQLite 锁冲突） |
 
 ## 如何运行
 
@@ -76,8 +86,8 @@ python3 fix_antigravity_context.py --target /路径一/agy --target /路径二/l
 
 默认分别查这两个目录各自最近活跃的数据库（同时考虑主文件和 -wal 修改时间）：
 
-- `~/.gemini/antigravity/conversations/*.db`（IDE / 部分桌面会话）
-- `~/.gemini/antigravity-cli/conversations/*.db`（CLI）
+- `~/.gemini/antigravity/conversations/*.db`（Antigravity IDE 与 Antigravity Desktop App 共用）
+- `~/.gemini/antigravity-cli/conversations/*.db`（agy CLI 与 Remote Control 守护进程共用）
 
 会话**不强行关联到某个发现的后端**，可能属于旧版本、另一安装或其他模型。最新空会话、数据库不可读、schema 变化报告 UNKNOWN。protobuf 截断、越界、非法 varint 或字段类型错误同样返回 UNKNOWN，不会验收通过。
 
@@ -122,7 +132,7 @@ python3 verify_session.py --db /实际路径/session.db
 - [ARM64 维护说明](https://github.com/lmxxf/antigravity-context-fix/blob/main/arm-linux/readme.md)
 - [原始文章](https://github.com/lmxxf/ai-theorys-study/blob/main/wechat/340-A.md)
 
-上游的绝对地址只适用于对应构建。这里通过 Go pclntab 重找函数、从 getter 解码部分字段，支持普通地址移动，以及1.4.7那类 max_token_limit +16 → +12；ARM64 模型 getter 兼容 LDR / LDRSW，配置出口兼容 1.4.12 与 1.5.0 的两种寄存器布局。
+上游的绝对地址只适用于对应构建。这里通过 Go pclntab 重找函数、从 getter 解码部分字段，支持普通地址移动，以及1.4.7那类 max_token_limit +16 → +12；ARM64 模型 getter 兼容 LDR / LDRSW，x86_64 与 ARM64 的配置出口及预算赋值均兼容 1.4.12 与 1.5.0 的两种编译器布局。
 
 **不保证所有未来版本。** 函数名、Go 表格式、指令模式、模型编号、返回约定及数据库字段仍有假设；ARM64 外层 checkpoint 指针目前要求 +16。变化超出模式时需要适配，不能删除校验或试填旧偏移；结构匹配不能替代真实请求测试。
 
