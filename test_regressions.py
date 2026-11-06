@@ -16,6 +16,65 @@ from test_status import field, varint
 
 
 class RegressionTests(unittest.TestCase):
+    def test_inplace_replacement_restores_target_on_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target, source = root / 'agy', root / 'patched'
+            target.write_bytes(b'original-bytes')
+            source.write_bytes(b'patched-bytes')
+            rollback = target.read_bytes()
+            real_write = f._overwrite_file
+            calls = []
+
+            def flaky(dest, payload):
+                calls.append(payload)
+                if len(calls) == 1:
+                    dest.write_bytes(b'truncated')
+                    raise OSError(28, 'No space left on device')
+                real_write(dest, payload)
+
+            with patch.object(f, '_overwrite_file', side_effect=flaky):
+                with self.assertRaises(OSError):
+                    f.overwrite_in_place(source, target, rollback)
+            self.assertEqual(target.read_bytes(), b'original-bytes')
+            self.assertTrue(source.exists())
+
+            f.overwrite_in_place(source, target, rollback)
+            self.assertEqual(target.read_bytes(), b'patched-bytes')
+            self.assertFalse(source.exists())
+
+    def test_replace_refuses_truncating_write_without_rollback(self):
+        class WinError6(OSError):
+            winerror = 6
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target, source = root / 'agy', root / 'patched'
+            target.write_bytes(b'original')
+            source.write_bytes(b'patched')
+            with patch.object(f, 'wait_for_backends'), \
+                 patch.object(f.os, 'name', 'nt'), \
+                 patch.object(f, '_replace_atomic', side_effect=WinError6(6, 'invalid handle')):
+                with self.assertRaises(RuntimeError):
+                    f.replace_with_retry(source, target, hashlib.sha256(b'original').hexdigest())
+            self.assertEqual(target.read_bytes(), b'original')
+
+    @unittest.skipUnless(os.environ.get('AGY_TEST_BINARY'), 'provide an original binary fixture')
+    def test_trampoline_host_falls_back_when_preferred_symbols_are_absent(self):
+        source = Path(os.environ['AGY_TEST_BINARY'])
+        img = f.BinaryImage(source.read_bytes())
+        _, text_va, funcs, hosts = f.locate_go_functions(img)
+        preferred = f.choose_trampoline_host(img, funcs, hosts, text_va)
+        self.assertTrue(preferred['symbol'].endswith(f.HOST_PREFERENCE[0]))
+        reduced = {n: v for n, v in hosts.items() if not n.endswith(f.HOST_PREFERENCE)}
+        fallback = f.choose_trampoline_host(img, funcs, reduced, text_va)
+        self.assertNotEqual(fallback['symbol'], preferred['symbol'])
+        self.assertGreaterEqual(fallback['file_end'] - fallback['file_start'], f.HOST_MIN_BYTES)
+        # Builds without any CheckpointConfig method must fail, never fall back to
+        # hooks.checkpointNeeded, which hosts native auto-compaction.
+        with self.assertRaises(RuntimeError):
+            f.choose_trampoline_host(img, funcs, {}, text_va)
+
     def test_backup_sync_uses_writable_handle_without_changing_contents(self):
         for existing in (False, True):
             with self.subTest(existing=existing), tempfile.TemporaryDirectory() as folder:

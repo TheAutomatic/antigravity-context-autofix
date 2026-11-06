@@ -7,12 +7,15 @@ Automatic Go pclntab locator and context/rules patcher for Antigravity:
 - Zero third-party dependencies (Python 3 standard library only)
 
 What it patches (dynamically located via Go 1.20+ pclntab & getter instruction decoding):
-1. applyFeatureProviderCheckpointOverrideConfig -> jumps to trampoline in (*CheckpointConfig).SetSessionSummaryPromptOverride+0x20
-2. (*CheckpointConfig).SetSessionSummaryPromptOverride -> returns at entry; hosts Argon trampoline at +0x20
+1. applyFeatureProviderCheckpointOverrideConfig -> jumps to a trampoline placed at +0x20 of an unreferenced
+   (*CheckpointConfig) setter (SetSessionSummaryPromptOverride first, then any uncalled Set* method)
+2. that setter -> returns at entry; hosts the Argon trampoline
    Sets max_token_limit = 900000 for Argon High/Medium/Low (1417/1418/1419) while keeping hooks.checkpointNeeded intact for native auto-compaction
 3. readGlobalRules / parseRuleFile / convertSkillPath -> per-file byte limit 24000 -> 1048576 (1 MiB)
 4. computeTruncatedCustomizations -> rules & customizations token budgets 20000 -> 131072 tokens
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
@@ -31,13 +34,31 @@ TARGET_FUNCS = {
     "GetPlannerConfig": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CascadeConfig).GetPlannerConfig",
     "GetPlanModel": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CascadePlannerConfig).GetPlanModel",
     "GetMaxTokenLimit": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CheckpointConfig).GetMaxTokenLimit",
-    "trampolineHost": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CheckpointConfig).SetSessionSummaryPromptOverride",
     "applyOverride": "google3/third_party/jetski/cortex/config/config.applyFeatureProviderCheckpointOverrideConfig",
     "checkpointNeeded": "google3/third_party/oneharness/internal/core/hooks/hooks.checkpointNeeded",
     "readGlobalRules": "google3/third_party/jetski/cortex/customizations/customizations.(*Manager).readGlobalRules",
     "parseRuleFile": "google3/third_party/jetski/cortex/customizations/customizations.(*Manager).parseRuleFile",
     "convertSkillPath": "google3/third_party/jetski/cortex/customizations/customizations.convertSkillPath",
     "computeTruncated": "google3/third_party/jetski/cortex/customizations/customizations.(*Manager).computeTruncatedCustomizations",
+}
+
+# The trampoline overwrites one unreferenced function entry plus 46 (x86_64) or
+# 48 (arm64) bytes at +0x20, so the host must stay byte-exactly restorable and
+# must never be reached. Preferred hosts are CheckpointConfig setters that
+# 1.4.12 and 1.5.0 builds never call; other builds let the linker drop them, so
+# any remaining (*CheckpointConfig).Set* method without a call site also works.
+# hooks.checkpointNeeded is never a candidate: native auto-compaction lives there.
+HOST_SYMBOL_MARKER = "cortex_pb/cortex_go_proto.(*CheckpointConfig)."
+HOST_PREFERENCE = (
+    "(*CheckpointConfig).SetSessionSummaryPromptOverride",
+    "(*CheckpointConfig).SetContextWindow",
+    "(*CheckpointConfig).SetCheckpointPromptOverride",
+    "(*CheckpointConfig).SetContinuationPromptOverride",
+)
+HOST_MIN_BYTES = 128
+HOST_NOOP_ENTRY = {
+    "x86_64": bytes.fromhex("31c031db31c9c3"),
+    "arm64": struct.pack("<4I", 0xD2800000, 0xD2800001, 0xD2800002, 0xD65F03C0),
 }
 
 ARGON_MAX_TOKEN_LIMIT = 900000
@@ -162,6 +183,8 @@ def locate_go_functions(img: BinaryImage):
         if ftab_base + (nfunc + 1) * 8 > len(img.data):
             continue
         found = {}
+        hosts = {}
+        marker = HOST_SYMBOL_MARKER.encode()
         for i in range(nfunc):
             entry_off, func_off = struct.unpack_from("<II", img.data, ftab_base + i * 8)
             func_rec = ftab_base + func_off
@@ -170,15 +193,24 @@ def locate_go_functions(img: BinaryImage):
             name_off = struct.unpack_from("<i", img.data, func_rec + 4)[0]
             if name_off < 0 or names_base + name_off >= len(img.data):
                 continue
-            end_s = img.data.find(b"\x00", names_base + name_off)
+            name_at = names_base + name_off
+            end_s = img.data.find(b"\x00", name_at)
             if end_s == -1:
                 continue
-            name = img.data[names_base + name_off : end_s].decode("utf-8", errors="replace")
-            if name in want_rev:
-                next_entry_off = struct.unpack_from("<I", img.data, ftab_base + (i + 1) * 8)[0]
-                found[want_rev[name]] = (entry_off, next_entry_off)
-                if len(found) == len(TARGET_FUNCS):
-                    break
+            is_host = img.data.find(marker, name_at, end_s) != -1
+            if not is_host and len(found) == len(TARGET_FUNCS):
+                continue
+            next_entry_off = struct.unpack_from("<I", img.data, ftab_base + (i + 1) * 8)[0]
+            if is_host:
+                name = img.data[name_at:end_s].decode("utf-8", errors="replace")
+                if name in want_rev:
+                    found[want_rev[name]] = (entry_off, next_entry_off)
+                else:
+                    hosts[name] = (entry_off, next_entry_off)
+            elif img.data.startswith(b"google3/third_party/", name_at):
+                name = img.data[name_at:end_s].decode("utf-8", errors="replace")
+                if name in want_rev:
+                    found[want_rev[name]] = (entry_off, next_entry_off)
         if len(found) == len(TARGET_FUNCS):
             go_text_va = text_start
             if go_text_va == 0:
@@ -198,21 +230,96 @@ def locate_go_functions(img: BinaryImage):
                 raise RuntimeError("Found pclntab but could not resolve Go text base VA from moduledata")
             funcs = {}
             for k, (s_off, e_off) in found.items():
-                va_s = go_text_va + s_off
-                va_e = go_text_va + e_off
-                foff_s = img.va_to_file(va_s)
-                foff_e = foff_s + (e_off - s_off)
-                funcs[k] = {
-                    "symbol": TARGET_FUNCS[k],
-                    "pc_start": s_off,
-                    "pc_end": e_off,
-                    "va_start": va_s,
-                    "va_end": va_e,
-                    "file_start": foff_s,
-                    "file_end": foff_e,
-                }
-            return idx, go_text_va, funcs
+                funcs[k] = describe_function(img, go_text_va, TARGET_FUNCS[k], s_off, e_off)
+            return idx, go_text_va, funcs, hosts
     raise RuntimeError(f"Could not locate the {len(TARGET_FUNCS)} required Go functions in pclntab")
+
+
+def describe_function(img: BinaryImage, go_text_va: int, symbol: str, pc_start: int, pc_end: int):
+    va_s = go_text_va + pc_start
+    foff_s = img.va_to_file(va_s)
+    return {
+        "symbol": symbol,
+        "pc_start": pc_start,
+        "pc_end": pc_end,
+        "va_start": va_s,
+        "va_end": go_text_va + pc_end,
+        "file_start": foff_s,
+        "file_end": foff_s + (pc_end - pc_start),
+    }
+
+
+def order_host_candidates(hosts: dict):
+    """Preferred symbols first, then the smallest remaining bodies, for a stable choice."""
+    ordered = []
+    for suffix in HOST_PREFERENCE:
+        ordered.extend(sorted(n for n in hosts if n.endswith(suffix) and n not in ordered))
+    ordered.extend(sorted((n for n in hosts if n not in ordered),
+                          key=lambda n: (hosts[n][1] - hosts[n][0], n)))
+    return ordered
+
+
+def go_text_bounds(img: BinaryImage, go_text_va: int):
+    """File range and VA delta of the executable segment holding the Go text."""
+    for _, sva, svsize, raw_ptr, raw_size, is_exec in img.segments:
+        if is_exec and sva <= go_text_va < sva + svsize:
+            return raw_ptr, raw_ptr + raw_size, sva - raw_ptr
+    raise RuntimeError("Go text is not inside an executable segment")
+
+
+def has_direct_call(img: BinaryImage, go_text_va: int, func_va: int):
+    """Conservative reachability scan: any relative branch or stored VA rejects the host."""
+    lo, hi, delta = go_text_bounds(img, go_text_va)
+    data = img.data
+    if data.find(struct.pack("<Q", func_va)) != -1:
+        return True  # Funcval or table entry: the body may be invoked indirectly.
+    if img.arch == "x86_64":
+        pos = lo
+        while True:
+            pos = data.find(b"\xe8", pos, hi - 4)
+            if pos < 0:
+                return False
+            if pos + delta + 5 + struct.unpack_from("<i", data, pos + 1)[0] == func_va:
+                return True
+            pos += 1
+    for index, (word,) in enumerate(struct.iter_unpack("<I", memoryview(data)[lo:hi - (hi - lo) % 4])):
+        if word & 0xFC000000 != 0x94000000:
+            continue
+        imm = word & 0x03FFFFFF
+        if imm & 0x02000000:
+            imm -= 0x04000000
+        if lo + index * 4 + delta + imm * 4 == func_va:
+            return True
+    return False
+
+
+def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_va: int):
+    """Pick a function body that is never called and large enough for the trampoline."""
+    if not hosts:
+        raise RuntimeError("No (*CheckpointConfig) method is available to host the trampoline")
+    required = {f["symbol"] for f in funcs.values()}
+    noop = HOST_NOOP_ENTRY[img.arch]
+    rejected = []
+    for symbol in order_host_candidates(hosts):
+        entry_off, end_off = hosts[symbol]
+        func = describe_function(img, go_text_va, symbol, entry_off, end_off)
+        size = func["file_end"] - func["file_start"]
+        if symbol in required:
+            continue
+        if size < HOST_MIN_BYTES:
+            rejected.append(f"{symbol}: {size} bytes")
+            continue
+        patched = img.data[func["file_start"] : func["file_start"] + len(noop)] == noop
+        if not patched and not valid_checkpoint_entry(img, func):
+            rejected.append(f"{symbol}: no Go stack check")
+            continue
+        if has_direct_call(img, go_text_va, func["va_start"]):
+            rejected.append(f"{symbol}: referenced")
+            continue
+        return func
+    raise RuntimeError(
+        "No unreferenced (*CheckpointConfig) method can host the trampoline ("
+        + ("; ".join(rejected[:4]) or "none present") + ")")
 
 
 def build_x86_64_plan(img: BinaryImage, funcs: dict):
@@ -246,8 +353,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
         raise RuntimeError("Could not uniquely locate epilogue (31 c9 c9 c3) in applyFeatureProviderCheckpointOverrideConfig")
 
     f_chk = funcs["trampolineHost"]
-    if f_chk["file_end"] - f_chk["file_start"] < 128:
-        raise RuntimeError("(*CheckpointConfig).SetSessionSummaryPromptOverride is too small to host trampoline")
+    if f_chk["file_end"] - f_chk["file_start"] < HOST_MIN_BYTES:
+        raise RuntimeError(f"{f_chk['symbol']} is too small to host the trampoline")
     chk_va = f_chk["va_start"]
     chk_foff = f_chk["file_start"]
     tramp_va = chk_va + 0x20
@@ -418,7 +525,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_entry",
-            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride: no-op return at entry",
+            "purpose": f"{f_chk['symbol']}: no-op return at entry",
             "va": hex(chk_va),
             "offset": hex(chk_foff),
             "before": data[chk_foff : chk_foff + len(chk_entry_after)].hex(),
@@ -427,7 +534,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -492,8 +599,8 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
     b_apply = fbytes("applyOverride")
     f_apply = funcs["applyOverride"]
     f_chk = funcs["trampolineHost"]
-    if f_chk["file_end"] - f_chk["file_start"] < 128:
-        raise RuntimeError("(*CheckpointConfig).SetSessionSummaryPromptOverride is too small to host trampoline")
+    if f_chk["file_end"] - f_chk["file_start"] < HOST_MIN_BYTES:
+        raise RuntimeError(f"{f_chk['symbol']} is too small to host the trampoline")
     chk_va = f_chk["va_start"]
     chk_foff = f_chk["file_start"]
     tramp_va = chk_va + 0x20
@@ -585,7 +692,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_entry",
-            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride: no-op return at entry",
+            "purpose": f"{f_chk['symbol']}: no-op return at entry",
             "va": hex(chk_va),
             "offset": hex(chk_foff),
             "before": data[chk_foff : chk_foff + len(chk_entry_after)].hex(),
@@ -594,7 +701,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -692,8 +799,9 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
     data = target.read_bytes()
     sha256 = hashlib.sha256(data).hexdigest()
     img = BinaryImage(data)
-    pcln_off, go_text_va, funcs = locate_go_functions(img)
+    pcln_off, go_text_va, funcs, hosts = locate_go_functions(img)
     try:
+        funcs = dict(funcs, trampolineHost=choose_trampoline_host(img, funcs, hosts, go_text_va))
         plan = build_x86_64_plan(img, funcs) if img.arch == "x86_64" else build_arm64_plan(img, funcs)
     except RuntimeError:
         upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir)
@@ -928,8 +1036,20 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
         patched_sha256 = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
         info["patched_sha256"] = patched_sha256
         info["patched_size"] = tmp_path.stat().st_size
-        replace_with_retry(tmp_path, target, target_disk_sha256)
+        # Persist the record that identifies the new hash before the binary can
+        # land, so a successful replacement always has a restore entry; drop it
+        # again when nothing was written.
+        previous_manifest = manifest_file.read_bytes() if manifest_file.exists() else None
         write_manifest(manifest_file, info)
+        try:
+            replace_with_retry(tmp_path, target, target_disk_sha256, rollback_bytes=raw_bytes)
+        except BaseException:
+            if hashlib.sha256(target.read_bytes()).hexdigest() != patched_sha256:
+                if previous_manifest is None:
+                    manifest_file.unlink(missing_ok=True)
+                else:
+                    manifest_file.write_bytes(previous_manifest)
+            raise
     except PermissionError as e:
         raise RuntimeError(
             f"PermissionError replacing {target} (file is locked by a running Antigravity/agy process).\n"
@@ -952,7 +1072,8 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
 
 
 def restore_target(target: Path, backup_dir: Path):
-    before_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+    before_bytes = target.read_bytes()
+    before_sha256 = hashlib.sha256(before_bytes).hexdigest()
     print(f"\nTarget : {target} (SHA256: {before_sha256})")
     mf, mdata, bak = select_restore_backup(target, backup_dir, before_sha256)
     bak_bytes = bak.read_bytes()
@@ -969,7 +1090,7 @@ def restore_target(target: Path, backup_dir: Path):
             os.chmod(tmp_p, target.stat().st_mode & 0o777)
         except Exception:
             pass
-        replace_with_retry(tmp_p, target, before_sha256)
+        replace_with_retry(tmp_p, target, before_sha256, rollback_bytes=before_bytes)
     finally:
         if tmp_p.exists():
             try:
@@ -1050,24 +1171,51 @@ def wait_for_backends(targets):
             raise SystemExit("Cancelled. No backend replaced.")
 
 
-def replace_with_retry(source, target, expected_sha256):
+def _replace_atomic(source, target):
+    """os.replace, retried briefly: antivirus scanners can fail it with WinError 6."""
+    for attempt in range(3):
+        try:
+            os.replace(source, target)
+            return
+        except OSError as e:
+            if os.name != "nt" or getattr(e, "winerror", None) != 6 or attempt == 2:
+                raise
+            time.sleep(0.2)
+
+
+def _overwrite_file(target, payload):
+    with target.open("r+b") as handle:
+        handle.write(payload)
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def overwrite_in_place(source, target, rollback_bytes):
+    """Write source over target without a rename, restoring rollback_bytes on any failure."""
+    payload = Path(source).read_bytes()
+    try:
+        _overwrite_file(target, payload)
+        if hashlib.sha256(target.read_bytes()).hexdigest() != hashlib.sha256(payload).hexdigest():
+            raise RuntimeError(f"in-place write of {target} did not verify")
+    except BaseException:
+        try:
+            _overwrite_file(target, rollback_bytes)
+        except Exception as restore_error:
+            raise RuntimeError(
+                f"{target} could not be written and restoring the verified bytes also failed "
+                f"({restore_error}). Run --restore before launching Antigravity.") from restore_error
+        raise
+    Path(source).unlink()
+
+
+def replace_with_retry(source, target, expected_sha256, rollback_bytes=None):
     while True:
         wait_for_backends([target])
         if hashlib.sha256(target.read_bytes()).hexdigest() != expected_sha256:
             raise RuntimeError(f"Backend changed before replacement: {target}; rerun the check")
         try:
-            try:
-                os.replace(source, target)
-            except OSError as e:
-                if os.name == "nt" and getattr(e, "winerror", None) == 6:
-                    data = Path(source).read_bytes()
-                    with open(target, "wb") as dst_f:
-                        dst_f.write(data)
-                        dst_f.flush()
-                        os.fsync(dst_f.fileno())
-                    Path(source).unlink()
-                else:
-                    raise
+            _replace_atomic(source, target)
             return
         except PermissionError:
             print(f"无法替换 {target}：文件被占用或目录不可写。")
@@ -1079,6 +1227,21 @@ def replace_with_retry(source, target, expected_sha256):
                 raise SystemExit("Replacement cancelled: no interactive input available.")
             if answer.strip().lower() != "y":
                 raise SystemExit("Replacement cancelled.")
+        except OSError as e:
+            # Some Python builds (Microsoft Store) cannot rename over files under
+            # AppData\Local\Programs. Overwrite only when the verified bytes are in
+            # hand, so a failed write can be rolled back instead of left truncated.
+            if os.name != "nt" or getattr(e, "winerror", None) != 6:
+                raise
+            if rollback_bytes is None:
+                raise RuntimeError(
+                    f"Cannot replace {target}: this Python build refuses to rename over it "
+                    f"(WinError 6) and no verified rollback copy is available. File left unchanged."
+                ) from e
+            print(f"  [warn] {target} 不支持原子替换 (WinError 6)，改为原地写入，失败时回滚"
+                  f" / in-place write with rollback")
+            overwrite_in_place(source, target, rollback_bytes)
+            return
 
 
 def inspect_context(conversation_id=None, db_path=None):

@@ -12,7 +12,7 @@ Patch the local Antigravity backend to raise the Argon High / Medium / Low reque
 | Windows | ARM64 / PE | Outside the expected scope for now | Unvalidated; compatibility is not guaranteed |
 | Linux | x86_64 / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
 | Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
-| macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | Locally verified on IDE 2.6.0 / agy 1.4.12 & 1.5.0: patching, signing, startup and new request window |
+| macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | Patch support implemented; the IDE 2.6.0 / agy 1.4.12 & 1.5.0 runs on this machine used the earlier trampoline scheme and do **not** validate the 900000 + native-auto-compaction change |
 | macOS | x86_64 (Intel) or Universal Mach-O | Unsupported | The parser only supports thin ARM64 Mach-O |
 
 Each backend must pass local structural checks; compatibility across all versions is not guaranteed. Intended clients do not imply that every installation layout has been tested.
@@ -108,9 +108,10 @@ Acceptance reports `latest_limit_ok: true` when both limits match. A stored wind
 ## Changes and signing
 
 - At final config merge, set `max_token_limit=900000` for Argon High / Medium / Low (IDs 1417–1419) so both the request window and native auto-compaction trigger sit safely below the 1,048,576 server hard limit.
-- **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction triggers at 900K tokens; host the 46/48-byte trampoline inside the unreferenced protobuf setter `(*CheckpointConfig).SetSessionSummaryPromptOverride`.
+- **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction still triggers at 900K tokens. The 46/48-byte trampoline goes into one (*CheckpointConfig) method chosen at patch time: `SetSessionSummaryPromptOverride` first, otherwise any other `(*CheckpointConfig).*` method that has no call site or stored address, a valid Go stack check and enough room. The chosen symbol is written to the manifest.
 - Raise per-file rule / skill cap from 24000 bytes to **1 MiB**.
 - Raise rules and customizations budgets from 20000 to **131072 tokens** each. Rule budget changes are not gated by the three-model window condition.
+- When the running Python (for example the Microsoft Store build) refuses `os.replace` in the target directory (WinError 6), it retries and then uses a verified in-place write with rollback; without verified rollback bytes it reports the failure instead of truncating the target.
 
 Code edits preserve length; macOS signing may change final size. System codesign performs ad-hoc signing with `--force --sign -` on a temporary file, without a developer certificate. Signing and patch checks must pass before replacement. Vendor identity / notarization trust is not retained. Gatekeeper and SIP are not disabled.
 
@@ -124,7 +125,7 @@ Thanks to [@lmxxf](https://github.com/lmxxf) for the investigation and patch str
 
 Upstream absolute offsets are build-specific. This script relocates functions using Go pclntab and decodes getter field offsets, handling ordinary address movement and changes such as max_token_limit +16 to +12 in 1.4.7. ARM64 model getters support LDR and LDRSW; both x86_64 and ARM64 config exits and budget assignments support the 1.4.12 and 1.5.0 compiler layouts.
 
-Future builds are not guaranteed. Symbols, table formats, instruction patterns, model IDs, return conventions and protobuf fields remain assumptions. The ARM64 outer checkpoint pointer currently requires +16. Unsupported changes require code adaptation, not old offsets or removed validation. Structural compatibility is not real-request validation.
+Future builds are not guaranteed. Symbols, table formats, instruction patterns, model IDs, return conventions and protobuf fields remain assumptions. The ARM64 outer checkpoint pointer currently requires +16. The trampoline host is chosen per build: if every `(*CheckpointConfig).*` method is referenced or too small, patching is refused with the rejection reasons and **never** falls back to short-circuiting `hooks.checkpointNeeded`. Unsupported changes require code adaptation, not old offsets or removed validation. Structural compatibility is not real-request validation.
 
 Updates overwrite patches. Check first after upgrading, then apply as needed. Hash-specific backups cannot be forced onto a mismatching new build.
 

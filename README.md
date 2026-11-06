@@ -12,7 +12,7 @@
 | Windows | ARM64 / PE | 暂不列入预期范围 | 未验证，不保证适配 |
 | Linux | x86_64 / ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
 | Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
-| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE 2.6.0 / agy 1.4.12 & 1.5.0 已实测修改、签名、启动与新请求窗口 |
+| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 已实现补丁支持；本机 IDE 2.6.0 / agy 1.4.12 & 1.5.0 的实测结果来自旧版跳板方案，**尚未验证**本次 900000 + 保留原生自动压缩的方案 |
 | macOS | x86_64（Intel）或 Universal Mach-O | 暂不支持 | 解析器只支持薄格式 ARM64 Mach-O |
 
 适用与否以本机后端的结构检查结果为准，不能保证所有版本。表中的客户端是预期范围，不代表每种安装布局均已实测。
@@ -118,9 +118,10 @@ python3 verify_session.py --db /实际路径/session.db
 ## 修改内容与 Mac 签名
 
 - Argon High / Medium / Low（当前编号1417/1418/1419）最终配置出口写入 `max_token_limit=900000`（请求与自动压缩窗口 **900000**，为本地估算与云端分词器误差预留余量，防止超过服务端 1048576 上限报 400）。
-- **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为借用全二进制零外部调用的空闲方法 `(*CheckpointConfig).SetSessionSummaryPromptOverride` 放置 46/48 字节跳板，使对话接近 900K 时自动触发原生 `<CONTEXT_SUMMARY>` 压缩。
+- **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为在 `(*CheckpointConfig)` 的一组候选宿主中挑选：优先 `SetSessionSummaryPromptOverride`，该符号被链接器裁掉时改用其余 `(*CheckpointConfig).*` 方法中**没有任何调用点**、且入口为合法 Go 栈检查、长度足够的一个；实际宿主写入清单。
 - 规则 / skill 单文件读取上限从24000字节提高到 **1 MiB**。
 - Rules / Customizations 总预算从20000各提高到 **131072 tokens**。规则预算的修改不限于三档窗口选择条件。
+- 若当前 Python（如 Microsoft Store 版）在目标目录拒绝 `os.replace`（WinError 6），先重试，再改为带校验的回滚式原地写入；没有可回滚的已验证字节时直接报错，绝不截断目标文件。
 
 代码补丁保持长度；Mac 签名可能改变最终大小。使用系统 `codesign --force --sign -` 做本地 ad-hoc 签名，无需证书；签名和补丁校验通过才替换。不保留原厂开发者身份/公证信任，不关闭 Gatekeeper 或 SIP。
 
@@ -134,7 +135,7 @@ python3 verify_session.py --db /实际路径/session.db
 
 上游的绝对地址只适用于对应构建。这里通过 Go pclntab 重找函数、从 getter 解码部分字段，支持普通地址移动，以及1.4.7那类 max_token_limit +16 → +12；ARM64 模型 getter 兼容 LDR / LDRSW，x86_64 与 ARM64 的配置出口及预算赋值均兼容 1.4.12 与 1.5.0 的两种编译器布局。
 
-**不保证所有未来版本。** 函数名、Go 表格式、指令模式、模型编号、返回约定及数据库字段仍有假设；ARM64 外层 checkpoint 指针目前要求 +16。变化超出模式时需要适配，不能删除校验或试填旧偏移；结构匹配不能替代真实请求测试。
+**不保证所有未来版本。** 函数名、Go 表格式、指令模式、模型编号、返回约定及数据库字段仍有假设；ARM64 外层 checkpoint 指针目前要求 +16。跳板宿主按构建现场挑选：若某构建里所有 `(*CheckpointConfig).*` 方法都被调用或规模不足，脚本会拒绝修改并列出被拒原因，**不会**退回老方案去短路 `hooks.checkpointNeeded`。变化超出模式时需要适配，不能删除校验或试填旧偏移；结构匹配不能替代真实请求测试。
 
 自动升级会覆盖补丁，升级后先查状态再决定是否重打。备份按构建哈希区分，不把旧备份硬套到新版。
 
