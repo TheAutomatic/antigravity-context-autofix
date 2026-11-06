@@ -51,8 +51,8 @@ python3 scripts/fix_antigravity_context.py --restore
 ## Workflow
 
 1. Discover current-user default locations, PATH and known application directories. Resolve symlinks and deduplicate real paths.
-2. Report each backend's format, architecture, SHA256, patch state and compatibility.
-3. Report the most recently modified database separately for IDE and CLI. No model launch or request is sent.
+2. Report each backend's format, architecture, SHA256, patch state, selected trampoline host symbol, and compatibility.
+3. Report the most recently active database separately for IDE/App and CLI (considering both the main file and `-wal` mtime), showing a **live token usage progress bar (`Used / Limit tokens` and percentage)**, time since last activity, and first-prompt topic preview, followed by the **Top 5 Recent Active Conversations** leaderboard. No model launch or request is sent.
 4. In patch mode, stop before changes if any selected backend is incompatible or partially patched. Use repeated `--target PATH` options to select a supported subset. Restore independently verifies current-file and backup hashes without requiring patch-parser compatibility.
 5. List actual action paths and backup directory. Only explicit Y at `Continue? [y/N]` proceeds. Enter, other input and EOF cancel. If all files are patched already, exit without changes.
 6. Patch mode then asks how to treat old backups: `1` (default, just press Enter) prunes backups that do not belong to the installed build after a successful patch, keeping only this build's original and manifest; `2` keeps every existing backup. No input or an unrecognised answer keeps them; restore never prunes.
@@ -81,9 +81,14 @@ python3 scripts/fix_antigravity_context.py --status --target /actual/path/agy
 python3 scripts/fix_antigravity_context.py --target /one/agy --target /two/language_server
 ```
 
-## Status interpretation and context inspection
+## Status interpretation and live context inspection (`/context` alternative for IDE & App)
 
-The latest active DB from each directory is reported separately, considering both the database and its -wal modification time:
+Because Antigravity IDE and Desktop App do not expose the CLI's `/context` slash command in the GUI, double-clicking `windows-check-status.cmd` / `macos-check-status.command` (or running `./linux-autofix.sh --status`) acts as a live context dashboard:
+
+1. **Latest Session Snapshot per Surface**: Decodes both `gen_used_tokens` and `gen_max_context_tokens` from the latest turn in `gen_metadata`, rendering a color-coded progress bar (`<75%` green, `75%–90%` yellow, `>=90%` red).
+2. **Top 5 Recent Active Conversations**: Ranked by real-time `.db` / `-wal` write timestamps, showing **elapsed time since last turn** (e.g. `5s ago`), **short conversation ID**, **token usage bar**, and the **first user prompt preview** from `transcript.jsonl` so you can immediately tell which open window is which.
+
+The two conversation directories inspected by default are:
 
 - `~/.gemini/antigravity/conversations/*.db` (shared by Antigravity IDE and Antigravity Desktop App)
 - `~/.gemini/antigravity-cli/conversations/*.db` (used by `agy` CLI and Remote Control daemon)
@@ -163,7 +168,7 @@ Inspection exits 0 if all selected binaries match, 2 if none found or any incomp
 
 ## Validation and tests
 
-See the opening table for validation on actual installations; a new request on that Mac recorded **983040** in both gen and executor metadata. agy 1.5.0 ARM64 also passed temporary-copy patching, macOS signing and exact restoration, and the patch has been applied locally; a new session after patching recorded **983040** for both request and executor limits. Development tests also cover repeated runs, error handling and simulated discovery layouts for all three systems. No over-256K long-session stress test or all-model validation was performed.
+See the opening table for validation on actual installations: on Windows (`agy.exe` 1.4.12 / 1.5.0 and `language_server.exe` CL 1009437749 / 1013060670), the **900000** window patch, startup, automatic `<CONTEXT_SUMMARY>` compaction past 870K tokens, and live usage progress bars have all been verified on live sessions. On macOS (IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64), signing and startup were verified under the earlier 983040 scheme; the 900000 + native auto-compaction scheme is covered by unit tests and awaits live Mac re-verification.
 
 ```bash
 python3 -m unittest discover -s scripts -v

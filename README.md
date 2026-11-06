@@ -53,8 +53,8 @@ python3 scripts/fix_antigravity_context.py --restore
 ## 执行流程
 
 1. 发现当前用户默认位置、PATH 和已知应用目录的后端，解析符号链接并按真实路径去重。
-2. 逐个显示路径、格式、架构、SHA256、补丁状态及是否兼容。
-3. 分别查询 IDE / CLI 各自最近活跃的数据库（同时考虑主文件和 -wal 修改时间），显示实际请求上限与 executor 配置上限。不启动模型、不发送请求。
+2. 逐个显示路径、格式、架构、SHA256、补丁状态、跳板宿主函数及是否兼容。
+3. 分别查询 IDE/App 与 CLI 各自最近活跃的数据库（同时考虑主文件和 -wal 修改时间），显示**实时已用 Token 进度条（`Used / Limit tokens` 与百分比）**、最后活跃时间与首句主题摘要，并列出**近期活跃 Top 5 对话的上下文排行**（代替 IDE / App 中缺失的 `/context` 面板）。不启动模型、不发送请求。
 4. 修改模式下，存在不兼容或部分修改的目标时停止，不修改任何目标；可用 `--target` 只选择确认过的目标。恢复模式独立核验当前文件与备份哈希，不要求通过补丁适配检查。
 5. 列出实际待修改或恢复的路径与备份目录，询问 `Continue? [y/N]`。只有明确输入 Y 才继续；回车、其他输入或无交互输入均取消。全部已修补则报告无需修改。
 6. 修改模式再询问老版本备份如何处理：`1`（默认，回车即可）打完补丁后清理不属于当前构建的备份，只保留当前版本的原版与清单；`2` 保留全部已有备份。无输入或无法识别的回答按保留处理（恢复模式不清理）。
@@ -83,9 +83,14 @@ python3 scripts/fix_antigravity_context.py --status --target /实际路径/agy
 python3 scripts/fix_antigravity_context.py --target /路径一/agy --target /路径二/language_server
 ```
 
-## 状态解读与上下文查询
+## 状态解读与实时上下文查询（IDE / App 端 `/context` 替代方案）
 
-默认分别查这两个目录各自最近活跃的数据库（同时考虑主文件和 -wal 修改时间）：
+由于 Antigravity IDE 和 Desktop App 的图形界面目前没有提供 CLI 里的 `/context` 斜杠命令，双击运行 `windows-check-status.cmd` / `macos-check-status.command`（或执行 `./linux-autofix.sh --status`）即可随时查看：
+
+1. **各端最近活跃会话快照**：直接从 `gen_metadata` 解码最后一轮请求的**当前已用 Token 数（`gen_used_tokens`）**与**窗口上限（`gen_max_context_tokens`）**，绘制彩色进度条（`<75%` 绿色、`75%~90%` 黄色、`>=90%` 红色预警）。
+2. **近期活跃 Top 5 对话排行**：按数据库与 `-wal` 预写日志的实时写入时间排序，同时显示**距今活跃时间**（如 `5s ago`）、**会话短 ID**、**Token 进度条**以及从 `transcript.jsonl` 提取的**首句主题摘要**，一眼区分当前正在聊的是哪个窗口。
+
+默认分别扫描以下两个会话库目录：
 
 - `~/.gemini/antigravity/conversations/*.db`（Antigravity IDE 与 Antigravity Desktop App 共用）
 - `~/.gemini/antigravity-cli/conversations/*.db`（agy CLI 与 Remote Control 守护进程共用）
@@ -167,7 +172,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 
 ## 验证与测试
 
-实机验证范围见开头表格；该 Mac 的新请求 gen / executor 均记录为 **983040**。agy 1.5.0 ARM64 已通过临时副本修改、Mac 签名与精确恢复，并已应用到本机；修改后新会话的 request / executor 均验证为 **983040**。开发测试另覆盖重复运行、异常处理及三系统发现布局模拟。未做超过256K长会话压力测试或全部模型验证。
+实机验证范围见开头表格：Windows 本机（`agy.exe` 1.4.12 / 1.5.0 与 `language_server.exe` CL 1009437749 / 1013060670）已完成 900000 窗口修改、启动、长会话超 87 万 Token 自动触发 `<CONTEXT_SUMMARY>` 压缩回落及实时进度条查询验证。macOS 端（IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64）此前已验证旧版 983040 跳板方案的签名与启动，新版 900000 + 保留原生自动压缩方案已通过架构单测，待 Mac 实机复核。
 
 ```bash
 python3 -m unittest discover -s scripts -v
