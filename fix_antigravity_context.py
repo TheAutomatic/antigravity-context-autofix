@@ -1433,6 +1433,9 @@ def preflight(targets, conversation_id=None, db_path=None):
         print(f"      Status : {st_badge}  {compat_badge}")
         if "error" in info:
             print(f"      Reason : " + _style(info["error"], "31", c_on))
+        else:
+            host = info["functions"]["trampolineHost"]["symbol"].rsplit(".", 1)[-1]
+            print(f"      Host   : {host}")
         if idx < len(binaries):
             print()
 
