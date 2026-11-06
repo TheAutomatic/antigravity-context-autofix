@@ -27,20 +27,26 @@ Across Antigravity IDE, Desktop App, and CLI (`agy` / Remote Control), binaries 
 | **Antigravity Desktop App** | `<app>/resources/bin/language_server(.exe)` | `~/.gemini/antigravity/conversations` | Uses its own bundled `language_server` binary, but **shares conversation DBs with IDE** (IDE chats appear in Desktop App) |
 | **agy CLI / Remote Control** | `~/.gemini/bin/agy(.exe)` (or standalone `agy`) | `~/.gemini/antigravity-cli/conversations` | **Shares `agy` backend with IDE**, but uses an isolated `antigravity-cli` DB directory (avoiding SQLite lock contention while IDE/App is open) |
 
-## Run
+## Run (Quick Launchers by OS)
 
-Run from the repository. Use `python` on Windows, `python3` on macOS / Linux. An absolute script path works from any directory.
+The repository root provides OS-specific launchers by function, while the core Python scripts and unit tests live inside `scripts/`:
+
+| OS | Check Status & Live Context Usage Bar (Read-Only) | Back Up & Patch All | Restore Original |
+|---|---|---|---|
+| **Windows** (Double-click) | `windows-check-status.cmd` | `windows-fix-all.cmd` | `windows-restore-all.cmd` |
+| **macOS** (Double-click in Finder) | `macos-check-status.command` | `macos-fix-all.command` | `macos-restore-all.command` |
+| **Linux** (One-line command) | `./linux-autofix.sh --status` | `./linux-autofix.sh` | `./linux-autofix.sh --restore` |
+
+You can also invoke the Python scripts in `scripts/` directly (`python` on Windows, `python3` on macOS / Linux):
 
 ```bash
-# Read-only discovery, compatibility and context report
-python3 fix_antigravity_context.py --status
+# Read-only discovery, compatibility and live session token usage report
+python3 scripts/fix_antigravity_context.py --status
 # Review targets and type Y before backups / patching
-python3 fix_antigravity_context.py
+python3 scripts/fix_antigravity_context.py
 # Verify matching backups, review targets and type Y to restore
-python3 fix_antigravity_context.py --restore
+python3 scripts/fix_antigravity_context.py --restore
 ```
-
-Windows wrappers: check-status.cmd, fix-all.cmd, restore-all.cmd, verify-latest.cmd. They do not terminate processes by default.
 
 ## Workflow
 
@@ -71,8 +77,8 @@ Within applications, discovery checks known bin, resources/bin, resources/app/bi
 Discovery is bounded, not a disk-wide scan or other-user scan. Portable copies, arbitrary paths, containers, remote hosts and unknown layouts can be missed. `--target` replaces discovery and is repeatable:
 
 ```bash
-python3 fix_antigravity_context.py --status --target /actual/path/agy
-python3 fix_antigravity_context.py --target /one/agy --target /two/language_server
+python3 scripts/fix_antigravity_context.py --status --target /actual/path/agy
+python3 scripts/fix_antigravity_context.py --target /one/agy --target /two/language_server
 ```
 
 ## Status interpretation and context inspection
@@ -98,10 +104,10 @@ These databases are not mapped to a particular discovered executable. They may b
 Restart the IDE / CLI after patching, send a new Argon High / Medium / Low request and inspect that conversation:
 
 ```bash
-python3 fix_antigravity_context.py --status --conversation-id UUID
-python3 fix_antigravity_context.py --status --db /path/session.db
-python3 verify_session.py UUID
-python3 verify_session.py --db /path/session.db
+python3 scripts/fix_antigravity_context.py --status --conversation-id UUID
+python3 scripts/fix_antigravity_context.py --status --db /path/session.db
+python3 scripts/verify_session.py UUID
+python3 scripts/verify_session.py --db /path/session.db
 ```
 
 Acceptance reports `latest_limit_ok: true` when both limits match. A stored window does not prove future requests, all models or retention beyond 256K. Recheck after changing models. Lost or summarized history is not restored. No test request is sent automatically.
@@ -137,9 +143,9 @@ Original backups mean exact pre-patch bytes, not authenticated vendor originals.
 Default backup directory: `~/.gemini/agy-patches/` (relative to the Windows user profile there). Original .bak files and JSON manifests contain original / patched hashes and patch locations. Restore verifies a matching current hash and backup hash without requiring patch-parser compatibility, restoring original signature bytes too. Original backups are flushed to disk before replacement; backup directory changes are also persisted on supported platforms.
 
 ```bash
-python3 fix_antigravity_context.py --restore --target /actual/path/agy
-python3 fix_antigravity_context.py --restore --backup-dir /backups --target /actual/path/agy
-python3 fix_antigravity_context.py --status --json-out report.json
+python3 scripts/fix_antigravity_context.py --restore --target /actual/path/agy
+python3 scripts/fix_antigravity_context.py --restore --backup-dir /backups --target /actual/path/agy
+python3 scripts/fix_antigravity_context.py --status --json-out report.json
 ```
 
 | Option | Purpose |
@@ -160,9 +166,9 @@ Inspection exits 0 if all selected binaries match, 2 if none found or any incomp
 See the opening table for validation on actual installations; a new request on that Mac recorded **983040** in both gen and executor metadata. agy 1.5.0 ARM64 also passed temporary-copy patching, macOS signing and exact restoration, and the patch has been applied locally; a new session after patching recorded **983040** for both request and executor limits. Development tests also cover repeated runs, error handling and simulated discovery layouts for all three systems. No over-256K long-session stress test or all-model validation was performed.
 
 ```bash
-python3 -m unittest -v test_regressions test_status test_macos
+python3 -m unittest discover -s scripts -v
 # Optional macOS copy-only integration; supply an original binary / backup
-AGY_TEST_BINARY=/path/original.bak python3 -m unittest -v test_macos
+AGY_TEST_BINARY=/path/original.bak python3 -m unittest discover -s scripts -p test_macos.py -v
 ```
 
 ## Scope

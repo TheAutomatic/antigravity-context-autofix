@@ -27,28 +27,28 @@ Antigravity 的三个客户端（IDE、Desktop App、CLI / Remote Control）在�
 | **Antigravity Desktop App** | 安装目录 `resources/bin/language_server(.exe)` | `~/.gemini/antigravity/conversations` | 拥有独立的 `language_server` 后端，但**与 IDE 读写同一个会话数据库**（IDE 里的对话在 App 中直接可见） |
 | **agy CLI / Remote Control** | `~/.gemini/bin/agy(.exe)`（或独立安装的 `agy`） | `~/.gemini/antigravity-cli/conversations` | **与 IDE 共用 `agy` 后端**，但使用独立的 `antigravity-cli` 会话库（避免与正在运行的 IDE / App 发生 SQLite 锁冲突） |
 
-## 如何运行
+## 如何运行（按系统快捷入口）
 
-进入仓库目录执行。Windows 用 `python`，macOS / Linux 用 `python3`。
+仓库根目录按操作系统与功能提供了一键快捷入口，核心 Python 脚本与单元测试统一收纳在 `scripts/` 文件夹下：
+
+| 系统 | 查看状态与实时上下文进度条（只读） | 一键备份并打补丁 | 一键恢复原版 |
+|---|---|---|---|
+| **Windows**（直接双击） | `windows-check-status.cmd` | `windows-fix-all.cmd` | `windows-restore-all.cmd` |
+| **macOS**（Finder 直接双击） | `macos-check-status.command` | `macos-fix-all.command` | `macos-restore-all.command` |
+| **Linux**（终端单条命令） | `./linux-autofix.sh --status` | `./linux-autofix.sh` | `./linux-autofix.sh --restore` |
+
+也可以直接调用 `scripts/` 下的 Python 脚本（Windows 用 `python`，macOS / Linux 用 `python3`）：
 
 ```bash
-# 只检查：发现安装、检查适配、查询 IDE / CLI 最近会话
-python3 fix_antigravity_context.py --status
+# 只检查：发现安装、检查适配、查看近期活跃对话的实时 Token 进度条
+python3 scripts/fix_antigravity_context.py --status
 
 # 正式运行：先汇总目标，只有输入 Y 才备份并修改
-python3 fix_antigravity_context.py
+python3 scripts/fix_antigravity_context.py
 
 # 恢复：先核验匹配备份，再输入 Y 恢复原始字节
-python3 fix_antigravity_context.py --restore
+python3 scripts/fix_antigravity_context.py --restore
 ```
-
-也可用脚本绝对路径从任意目录运行：
-
-```bash
-python3 /你的路径/antigravity-context-autofix/fix_antigravity_context.py --status
-```
-
-Windows 可双击 `check-status.cmd`、`fix-all.cmd`、`restore-all.cmd`、`verify-latest.cmd`。包装器默认不终止进程。
 
 ## 执行流程
 
@@ -79,8 +79,8 @@ Linux 通过 /proc/PID/exe 匹配所选后端真实路径，避免长进程名�
 **不是全盘扫描，不查其他用户。** 自定义目录、便携安装、容器、远端主机或未知布局可能漏掉，使用 `--target` 补充。该参数替代自动发现，可重复：
 
 ```bash
-python3 fix_antigravity_context.py --status --target /实际路径/agy
-python3 fix_antigravity_context.py --target /路径一/agy --target /路径二/language_server
+python3 scripts/fix_antigravity_context.py --status --target /实际路径/agy
+python3 scripts/fix_antigravity_context.py --target /路径一/agy --target /路径二/language_server
 ```
 
 ## 状态解读与上下文查询
@@ -106,12 +106,12 @@ python3 fix_antigravity_context.py --target /路径一/agy --target /路径二/l
 修改后重开 IDE / CLI，用 **Argon High / Medium / Low** 发新请求，再查对应会话：
 
 ```bash
-python3 fix_antigravity_context.py --status --conversation-id <会话UUID>
-python3 fix_antigravity_context.py --status --db /实际路径/session.db
+python3 scripts/fix_antigravity_context.py --status --conversation-id <会话UUID>
+python3 scripts/fix_antigravity_context.py --status --db /实际路径/session.db
 
 # 查询上下文 JSON：latest_limit_ok 应为 true
-python3 verify_session.py <会话UUID>
-python3 verify_session.py --db /实际路径/session.db
+python3 scripts/verify_session.py <会话UUID>
+python3 scripts/verify_session.py --db /实际路径/session.db
 ```
 
 记录的请求窗口不等于未来请求、所有模型或超过256K的历史保留效果。切换模型后再查；已丢失/已摘要的历史不会恢复。脚本不自动发送测试请求。
@@ -147,9 +147,9 @@ python3 verify_session.py --db /实际路径/session.db
 备份默认保存到用户主目录 `~/.gemini/agy-patches/`：原版 .bak 与记录原版/修改版 SHA256、补丁位置的 JSON 清单。恢复要求当前哈希匹配清单，并核验备份；不要求当前文件通过补丁适配检查，原始签名字节也会恢复。替换程序前确保原版备份写入磁盘；支持的平台同时保存备份目录变更。
 
 ```bash
-python3 fix_antigravity_context.py --restore --target /实际路径/agy
-python3 fix_antigravity_context.py --restore --backup-dir /备份目录 --target /实际路径/agy
-python3 fix_antigravity_context.py --status --json-out report.json
+python3 scripts/fix_antigravity_context.py --restore --target /实际路径/agy
+python3 scripts/fix_antigravity_context.py --restore --backup-dir /备份目录 --target /实际路径/agy
+python3 scripts/fix_antigravity_context.py --status --json-out report.json
 ```
 
 | 参数 | 作用 |
@@ -170,9 +170,9 @@ python3 fix_antigravity_context.py --status --json-out report.json
 实机验证范围见开头表格；该 Mac 的新请求 gen / executor 均记录为 **983040**。agy 1.5.0 ARM64 已通过临时副本修改、Mac 签名与精确恢复，并已应用到本机；修改后新会话的 request / executor 均验证为 **983040**。开发测试另覆盖重复运行、异常处理及三系统发现布局模拟。未做超过256K长会话压力测试或全部模型验证。
 
 ```bash
-python3 -m unittest -v test_regressions test_status test_macos
+python3 -m unittest discover -s scripts -v
 # Mac 可选集成：只修改临时副本，提供未修补原版或原版备份
-AGY_TEST_BINARY=/路径/原版备份.bak python3 -m unittest -v test_macos
+AGY_TEST_BINARY=/路径/原版备份.bak python3 -m unittest discover -s scripts -p test_macos.py -v
 ```
 
 ## 使用边界

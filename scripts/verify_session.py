@@ -118,6 +118,37 @@ def parse_gen_row(g: bytes):
     return chat, gen_limit
 
 
+def parse_gen_usage(g: bytes):
+    chat, gen_limit = parse_gen_row(g)
+    window = get_field(get_field(chat, 9), 10)
+    used_vals = [v for f, w, v in iter_fields(window) if f == 1 and w == 0]
+    gen_used = used_vals[-1] if used_vals else None
+    return chat, gen_limit, gen_used
+
+
+def get_conversation_preview(db_path: Path) -> str | None:
+    import re
+    cid = db_path.stem
+    app_dir = db_path.parent.parent
+    t_path = app_dir / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+    if not t_path.is_file():
+        return None
+    try:
+        with t_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                obj = json.loads(line)
+                if obj.get("type") == "USER_INPUT" and obj.get("content"):
+                    txt = str(obj["content"])
+                    m = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", txt, re.S)
+                    first_line = (m.group(1) if m else txt).strip().splitlines()
+                    if first_line:
+                        s = first_line[0].strip()
+                        return s[:36] + (".." if len(s) > 36 else "")
+    except Exception:
+        return None
+    return None
+
+
 def parse_exec_row(e: bytes):
     return get_field(get_field(get_field(e, 10), 2), 5, wire=0)
 
@@ -162,31 +193,40 @@ def inspect_session(conversation_id=None, expected_limit=None, db_path=None):
             raise ValueError("Session has no request metadata yet")
         g_first_idx, g_first = conn.execute("select idx, data from gen_metadata order by idx asc limit 1").fetchone()
         g_last_idx, g_last = conn.execute("select idx, data from gen_metadata order by idx desc limit 1").fetchone()
-        _, gen_limit_first = parse_gen_row(g_first)
-        _, gen_limit_last = parse_gen_row(g_last)
+        _, gen_limit_first, gen_used_first = parse_gen_usage(g_first)
+        _, gen_limit_last, gen_used_last = parse_gen_usage(g_last)
 
         e_first_idx, e_first = conn.execute("select idx, data from executor_metadata order by idx asc limit 1").fetchone()
         e_last_idx, e_last = conn.execute("select idx, data from executor_metadata order by idx desc limit 1").fetchone()
         exec_limit_first = parse_exec_row(e_first)
         exec_limit_last = parse_exec_row(e_last)
 
+    first_turn = {
+        "gen_idx": g_first_idx,
+        "gen_max_context_tokens": gen_limit_first,
+        "executor_idx": e_first_idx,
+        "executor_max_token_limit": exec_limit_first,
+    }
+    if gen_used_first is not None:
+        first_turn["gen_used_tokens"] = gen_used_first
+
+    latest_turn = {
+        "gen_idx": g_last_idx,
+        "gen_max_context_tokens": gen_limit_last,
+        "executor_idx": e_last_idx,
+        "executor_max_token_limit": exec_limit_last,
+    }
+    if gen_used_last is not None:
+        latest_turn["gen_used_tokens"] = gen_used_last
+        if gen_limit_last:
+            latest_turn["gen_usage_percent"] = round(gen_used_last / gen_limit_last * 100.0, 1)
 
     report = {
         "read_mode": read_mode,
         "db_path": str(db_path),
         "conversation_id": db_path.stem,
-        "first_turn": {
-            "gen_idx": g_first_idx,
-            "gen_max_context_tokens": gen_limit_first,
-            "executor_idx": e_first_idx,
-            "executor_max_token_limit": exec_limit_first,
-        },
-        "latest_turn": {
-            "gen_idx": g_last_idx,
-            "gen_max_context_tokens": gen_limit_last,
-            "executor_idx": e_last_idx,
-            "executor_max_token_limit": exec_limit_last,
-        },
+        "first_turn": first_turn,
+        "latest_turn": latest_turn,
         "expected_limit": 900000 if expected_limit is None else expected_limit,
         "latest_limit_ok": (
             gen_limit_last in ACCEPTED_LIMITS and exec_limit_last in ACCEPTED_LIMITS

@@ -13,8 +13,7 @@ if not defined PY (
     exit /b 1
 )
 
-echo === Checking Antigravity Backend Status (Read-Only) ===
-"%PY%" "%~dp0fix_antigravity_context.py" --check %*
+echo === Checking Antigravity Backend ^& Context Status (Read-Only) ===
+"%PY%" "%~dp0scripts\fix_antigravity_context.py" --status %*
 echo.
 pause
-

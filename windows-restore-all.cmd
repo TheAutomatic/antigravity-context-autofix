@@ -14,7 +14,6 @@ if not defined PY (
 )
 
 echo === Restoring Original Antigravity Backends ===
-"%PY%" "%~dp0fix_antigravity_context.py" --restore %*
+"%PY%" "%~dp0scripts\fix_antigravity_context.py" --restore %*
 echo.
 pause
-
