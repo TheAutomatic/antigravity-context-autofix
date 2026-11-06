@@ -111,22 +111,24 @@ def find_conversation_db(cid: str | None) -> Path:
     return max(all_dbs, key=database_activity)
 
 
-def parse_gen_row(g: bytes):
+def parse_gen_usage(g: bytes):
     chat = get_field(g, 1)
     window = get_field(get_field(chat, 9), 10)
     gen_limit = get_field(window, 4, wire=0)
-    return chat, gen_limit
-
-
-def parse_gen_usage(g: bytes):
-    chat, gen_limit = parse_gen_row(g)
-    window = get_field(get_field(chat, 9), 10)
-    used_vals = [v for f, w, v in iter_fields(window) if f == 1 and w == 0]
-    gen_used = used_vals[-1] if used_vals else None
+    used_vals = [(w, v) for f, w, v in iter_fields(window) if f == 1]
+    if any(w != 0 for w, _ in used_vals):
+        raise ValueError("Unexpected wire type for protobuf field 1")
+    gen_used = used_vals[-1][1] if used_vals else None
     return chat, gen_limit, gen_used
 
 
+def parse_gen_row(g: bytes):
+    chat, gen_limit, _ = parse_gen_usage(g)
+    return chat, gen_limit
+
+
 def get_conversation_preview(db_path: Path) -> str | None:
+    import itertools
     import re
     cid = db_path.stem
     app_dir = db_path.parent.parent
@@ -135,7 +137,9 @@ def get_conversation_preview(db_path: Path) -> str | None:
         return None
     try:
         with t_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
+            for line in itertools.islice(handle, 30):
+                if len(line) > 262144:
+                    continue
                 obj = json.loads(line)
                 if obj.get("type") == "USER_INPUT" and obj.get("content"):
                     txt = str(obj["content"])

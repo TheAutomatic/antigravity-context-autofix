@@ -1584,31 +1584,37 @@ def preflight(targets, conversation_id=None, db_path=None):
         else:
             print(f"  *   {label:<32} {ctx_badge}  ({_style(session['error'], '2', c_on)})")
 
-    from verify_session import conversation_dirs, database_activity
-    recent_list = []
-    for d in conversation_dirs():
-        if d.is_dir():
-            for db_f in sorted(d.glob("*.db"), key=database_activity, reverse=True)[:5]:
-                r_ctx = inspect_context(db_path=db_f)
+    if not conversation_id and not db_path:
+        from verify_session import conversation_dirs, database_activity
+        already_by_path = {s.get("db_path"): s for s in sessions if "db_path" in s}
+        recent_list = []
+        for d in conversation_dirs():
+            try:
+                cand_dbs = sorted(d.glob("*.db"), key=database_activity, reverse=True)[:5] if d.is_dir() else []
+            except OSError:
+                cand_dbs = []
+            for db_f in cand_dbs:
+                resolved_str = str(db_f.expanduser().resolve())
+                r_ctx = already_by_path.get(resolved_str) or inspect_context(db_path=db_f)
                 if "latest_turn" in r_ctx:
                     recent_list.append(r_ctx)
-    recent_list.sort(key=lambda x: x.get("recorded_at", 0), reverse=True)
-    if len(recent_list) > 1:
-        print("\n  " + _style("[3] 近期活跃对话上下文排行 / Recent Active Conversations (Top 5)", "1", c_on))
-        print("  " + _style(sep[:68], "2", c_on))
-        for r_s in recent_list[:5]:
-            lt = r_s["latest_turn"]
-            used = lt.get("gen_used_tokens", 0)
-            lim = lt["gen_max_context_tokens"]
-            pct = (used / lim * 100.0) if lim else 0.0
-            filled = min(12, int(round(12 * used / lim))) if lim else 0
-            b_str = "█" * filled + "░" * (12 - filled)
-            b_col = "32" if pct < 75 else ("33" if pct < 90 else "31")
-            ago_s = max(0, int(time.time() - r_s.get("recorded_at", time.time())))
-            ago_t = f"{ago_s}s" if ago_s < 60 else (f"{ago_s // 60}m" if ago_s < 3600 else f"{ago_s // 3600}h")
-            cid_short = Path(r_s["db_path"]).stem[:8]
-            topic = r_s.get("preview") or "-"
-            print(f"  [{ago_t:>4}] {cid_short}  {_style(b_str, b_col, c_on)} {used:>7,}/{lim:<7,} ({pct:4.1f}%) | {topic}")
+        recent_list.sort(key=lambda x: x.get("recorded_at", 0), reverse=True)
+        if len(recent_list) > 1:
+            print("\n  " + _style("[3] 近期活跃对话上下文排行 / Recent Active Conversations (Top 5)", "1", c_on))
+            print("  " + _style(sep[:68], "2", c_on))
+            for r_s in recent_list[:5]:
+                lt = r_s["latest_turn"]
+                used = lt.get("gen_used_tokens") or 0
+                lim = lt["gen_max_context_tokens"]
+                pct = (used / lim * 100.0) if lim else 0.0
+                filled = min(12, int(round(12 * used / lim))) if lim else 0
+                b_str = "█" * filled + "░" * (12 - filled)
+                b_col = "32" if pct < 75 else ("33" if pct < 90 else "31")
+                ago_s = max(0, int(time.time() - r_s.get("recorded_at", time.time())))
+                ago_t = f"{ago_s}s" if ago_s < 60 else (f"{ago_s // 60}m" if ago_s < 3600 else f"{ago_s // 3600}h")
+                cid_short = Path(r_s["db_path"]).stem[:8]
+                topic = r_s.get("preview") or "-"
+                print(f"  [{ago_t:>4}] {cid_short}  {_style(b_str, b_col, c_on)} {used:>7,}/{lim:<7,} ({pct:4.1f}%) | {topic}")
 
     print("\n  " + _style("Note: 仅反映历史请求记录；打补丁重启并发送新消息后刷新 / DB reflects past turns only.", "2", c_on))
 
