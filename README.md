@@ -118,7 +118,7 @@ python3 verify_session.py --db /实际路径/session.db
 ## 修改内容与 Mac 签名
 
 - Argon High / Medium / Low（当前编号1417/1418/1419）最终配置出口写入 `max_token_limit=900000`（请求与自动压缩窗口 **900000**，为本地估算与云端分词器误差预留余量，防止超过服务端 1048576 上限报 400）。
-- **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为在 `(*CheckpointConfig)` 的一组候选宿主中挑选：优先 `SetSessionSummaryPromptOverride`，该符号被链接器裁掉时改用其余 `(*CheckpointConfig).*` 方法中**没有外部进入**（同时检查 CALL/JMP 与 B/BL/B.cond/CBZ，函数内部自跳转不算）、**地址没有被存进数据段**（`__DWARF` / `.debug` 等调试段不计入，因为那里记录的是每个函数的绝对地址）、长度足够的一个；实际宿主写入清单。
+- **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为在 `(*CheckpointConfig)` 的一组候选宿主中挑选：优先 `SetSessionSummaryPromptOverride`，该符号被链接器裁掉时改用其余 `(*CheckpointConfig).*` 方法中**没有外部进入**（同时检查 CALL/JMP 与 B/BL/B.cond/CBZ，函数内部自跳转不算）、**地址没有被存进任何非调试段**（可执行段内的常量/指针也计入，仅排除 `__DWARF` / `.debug` 等调试段，因为那里记录的是每个函数的绝对地址）、长度足够的一个；实际宿主写入清单。
 - 规则 / skill 单文件读取上限从24000字节提高到 **1 MiB**。
 - Rules / Customizations 总预算从20000各提高到 **131072 tokens**。规则预算的修改不限于三档窗口选择条件。
 - 若当前 Python（如 Microsoft Store 版）在目标目录拒绝 `os.replace`（WinError 6），先重试，再改为带校验的回滚式原地写入；没有可回滚的已验证字节时直接报错，绝不截断目标文件。

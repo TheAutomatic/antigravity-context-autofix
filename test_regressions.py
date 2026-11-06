@@ -90,6 +90,7 @@ class RegressionTests(unittest.TestCase):
 
             with patch.object(f, 'analyze_binary', return_value=plan), \
                  patch.object(f, 'wait_for_backends'), \
+                 patch.object(f.os, 'name', 'nt'), \
                  patch.object(f, '_replace_atomic', side_effect=WinError6(6, 'invalid handle')), \
                  patch.object(f, '_overwrite_file', side_effect=flaky), \
                  contextlib.redirect_stdout(io.StringIO()):
@@ -98,6 +99,7 @@ class RegressionTests(unittest.TestCase):
             # An interrupted upgrade must leave the installed patched build in place,
             # not silently roll back to the pristine original.
             self.assertEqual(target.read_bytes(), current)
+            self.assertTrue(writes)
             self.assertEqual(writes[-1], current)
 
     def test_replace_refuses_truncating_write_without_rollback(self):
@@ -142,9 +144,27 @@ class RegressionTests(unittest.TestCase):
                 img = build(arch)
                 hosts = {'google3/x.(*CheckpointConfig).SetA': (0x100, 0x190),
                          'google3/x.(*CheckpointConfig).SetB': (0x190, 0x290)}
-                chosen = f.choose_trampoline_host(img, {}, hosts, 0x1000)
+                chosen, _ = f.choose_trampoline_host(img, {}, hosts, 0x1000)
                 self.assertEqual(chosen['symbol'], 'google3/x.(*CheckpointConfig).SetB')
                 self.assertEqual(chosen['va_start'], 0x1190)
+
+    def test_host_reference_scan_sees_backward_branches(self):
+        text_va, text_off, size = 0x1000, 0x400, 0x400
+        target_va = 0x1100
+        for encodings in (('B', 0x14000000), ('BL', 0x94000000)):
+            name, opcode = encodings
+            with self.subTest(kind=name):
+                # Branch placed after the target, so the displacement is negative.
+                for site_offset in (0x300, 0x200):
+                    data = bytearray(0x1000)
+                    site_va = text_va + site_offset
+                    imm = (target_va - site_va) >> 2
+                    self.assertLess(imm, 0)
+                    struct.pack_into('<I', data, text_off + site_offset, opcode | (imm & 0x03FFFFFF))
+                    img = _FakeImage('arm64', bytes(data),
+                                     [('__TEXT', text_va, size, text_off, size, True)])
+                    refs = f.collect_text_references(img, text_va, {target_va})
+                    self.assertEqual(refs.get(target_va), [site_va])
 
     def test_host_reference_scan_ignores_debug_addresses_but_not_data(self):
         text_va, text_off, size = 0x1000, 0x400, 0x400
@@ -157,7 +177,7 @@ class RegressionTests(unittest.TestCase):
         img = _FakeImage('x86_64', bytes(debugging),
                          [('__TEXT', text_va, size, text_off, size, True),
                           ('__DWARF', 0x2000, 0x100, 0x800, 0x100, False)])
-        self.assertEqual(f.choose_trampoline_host(img, {}, hosts, text_va)['va_start'], func_va)
+        self.assertEqual(f.choose_trampoline_host(img, {}, hosts, text_va)[0]['va_start'], func_va)
 
         data = bytearray(debugging)
         data[0x900:0x908] = stored
@@ -168,18 +188,27 @@ class RegressionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             f.choose_trampoline_host(img, {}, hosts, text_va)
 
+        # An executable segment also carries constants and pointers, so a stored
+        # VA inside __TEXT still counts as an indirect reference.
+        data = bytearray(debugging)
+        data[0x780:0x788] = stored
+        img = _FakeImage('x86_64', bytes(data),
+                         [('__TEXT', text_va, size, text_off, size, True)])
+        with self.assertRaises(RuntimeError):
+            f.choose_trampoline_host(img, {}, hosts, text_va)
+
     @unittest.skipUnless(os.environ.get('AGY_TEST_BINARY'), 'provide an original binary fixture')
     def test_trampoline_host_falls_back_when_preferred_symbols_are_absent(self):
         source = Path(os.environ['AGY_TEST_BINARY'])
         img = f.BinaryImage(source.read_bytes())
         _, text_va, funcs, hosts = f.locate_go_functions(img)
-        chosen = f.choose_trampoline_host(img, funcs, hosts, text_va)
+        chosen, ambiguous = f.choose_trampoline_host(img, funcs, hosts, text_va)
         self.assertIn(chosen['symbol'], hosts)
         self.assertGreaterEqual(chosen['file_end'] - chosen['file_start'], f.HOST_SPAN[img.arch])
         if any(n.endswith(f.HOST_PREFERENCE[0]) for n in hosts):
             self.assertTrue(chosen['symbol'].endswith(f.HOST_PREFERENCE[0]))
         reduced = {n: v for n, v in hosts.items() if not n.endswith(f.HOST_PREFERENCE)}
-        fallback = f.choose_trampoline_host(img, funcs, reduced, text_va)
+        fallback, _ = f.choose_trampoline_host(img, funcs, reduced, text_va)
         self.assertIn(fallback['symbol'], reduced)
         self.assertGreaterEqual(fallback['file_end'] - fallback['file_start'], f.HOST_SPAN[img.arch])
         # Builds without any CheckpointConfig method must fail, never fall back to
@@ -398,6 +427,13 @@ class RegressionTests(unittest.TestCase):
             target.write_bytes(data)
             self.assertEqual(f.analyze_binary(target, backup_dir=False)['status'], 'UNKNOWN_OR_PARTIAL')
             entry = next(c for c in plan['changes'] if c['name'] == 'trampolineHost_entry')
+            # NOPing part of the original prologue is neither our patch nor a valid
+            # original entry, so it must not be offered as UNPATCHED.
+            data = bytearray(original)
+            entry_offset = int(entry['offset'], 16)
+            data[entry_offset + 4:entry_offset + 8] = b'\x90\x90\x90\x90'
+            target.write_bytes(data)
+            self.assertEqual(f.analyze_binary(target)['status'], 'UNKNOWN_OR_PARTIAL')
             if plan['arch'] == 'arm64':
                 # A changed return-register sequence must not be accepted.
                 data = bytearray(original)

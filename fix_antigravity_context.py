@@ -22,6 +22,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -298,29 +299,32 @@ def collect_text_references(img: BinaryImage, go_text_va: int, wanted):
                 note(pos + delta + length + struct.unpack_from(fmt, data, pos + 1)[0], pos + delta)
                 pos += 1
         return sites
-    # Only words whose top byte can start B / BL / B.cond / CBZ / CBNZ are decoded.
+    # Decode only words whose top byte can start B, BL, B.cond, CBZ/CBNZ or
+    # TBZ/TBNZ. The immediate reaches into the top byte, so both directions of
+    # 0x14/0x94 are listed: 0x17fffff0 is a backward B, not a different opcode.
     span = (hi - lo) // 4 * 4
     msb = bytes(memoryview(data)[lo : lo + span][3::4])
-    for value in (0x14, 0x94, 0x54, 0x34, 0x35, 0xB4, 0xB5):
-        index = msb.find(value)
-        while index >= 0:
-            offset = lo + index * 4
-            word, site = struct.unpack_from("<I", data, offset)[0], offset + delta
-            if word & 0x7C000000 == 0x14000000:                     # B / BL
-                note(site + maybe_sign_extend(word & 0x03FFFFFF, 26) * 4, site)
-            elif word & 0xFF000010 == 0x54000000:                   # B.cond
-                note(site + maybe_sign_extend((word >> 5) & 0x7FFFF, 19) * 4, site)
-            elif word & 0x7E000000 == 0x34000000:                   # CBZ / CBNZ
-                note(site + maybe_sign_extend((word >> 5) & 0x7FFFF, 19) * 4, site)
-            index = msb.find(value, index + 1)
+    for match in re.finditer(rb"[\x14-\x17\x34-\x37\x54\x94-\x97\xb4-\xb7]", msb):
+        offset = lo + match.start() * 4
+        word, site = struct.unpack_from("<I", data, offset)[0], offset + delta
+        if word & 0x7C000000 == 0x14000000:                     # B / BL
+            note(site + maybe_sign_extend(word & 0x03FFFFFF, 26) * 4, site)
+        elif word & 0xFF000010 == 0x54000000:                   # B.cond
+            note(site + maybe_sign_extend((word >> 5) & 0x7FFFF, 19) * 4, site)
+        elif word & 0x7E000000 == 0x34000000:                   # CBZ / CBNZ
+            note(site + maybe_sign_extend((word >> 5) & 0x7FFFF, 19) * 4, site)
+        elif word & 0x7E000000 == 0x36000000:                   # TBZ / TBNZ
+            note(site + maybe_sign_extend((word >> 5) & 0x3FFF, 14) * 4, site)
     return sites
 
 
 def stored_address_present(img: BinaryImage, func_va: int):
-    """True if a data word holds this VA: funcval, itab or table entry."""
+    """True if any data word holds this VA: funcval, itab or table entry."""
     needle = struct.pack("<Q", func_va)
     for name, _, _, raw_ptr, raw_size, is_exec in img.segments:
-        if is_exec or not raw_size or name.startswith(DATA_SEGMENT_SKIP):
+        # Executable segments still hold constants and pointers, so only debug
+        # and relocation metadata are excluded.
+        if not raw_size or name.startswith(DATA_SEGMENT_SKIP):
             continue
         if img.data.find(needle, raw_ptr, raw_ptr + raw_size) != -1:
             return True
@@ -333,14 +337,21 @@ def externally_referenced(func, sites):
 
 
 def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_va: int):
-    """Pick a body that nothing reaches and that is big enough for the trampoline."""
+    """Pick a body nothing reaches.
+
+    Returns the function and whether a higher-priority candidate was rejected by
+    its prologue alone. That case is ambiguous: either the prologue was edited or
+    the build emits nosplit setters, and only the caller may decide.
+    """
     if not hosts:
         raise RuntimeError("No (*CheckpointConfig) method is available to host the trampoline")
     required = {f["symbol"] for f in funcs.values()}
     candidates = [n for n in order_host_candidates(hosts) if n not in required]
     records = {n: describe_function(img, go_text_va, n, *hosts[n]) for n in candidates}
     references = collect_text_references(img, go_text_va, {r["va_start"] for r in records.values()})
+    noop = HOST_NOOP_ENTRY[img.arch]
     rejected = []
+    first_unclean = None
     for name in candidates:
         func = records[name]
         size = func["file_end"] - func["file_start"]
@@ -353,7 +364,15 @@ def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_v
         if stored_address_present(img, func["va_start"]):
             rejected.append(f"{name}: address stored")
             continue
-        return func
+        if img.data[func["file_start"] : func["file_start"] + len(noop)] == noop:
+            return func, False          # keep an already patched host stable
+        if valid_checkpoint_entry(img, func):
+            # Switching hosts to dodge an edited prologue would hide the edit.
+            return func, first_unclean is not None
+        if first_unclean is None:
+            first_unclean = func
+    if first_unclean is not None:
+        return first_unclean, False     # no stack-checked method: nosplit host
     raise RuntimeError(
         "No unreferenced (*CheckpointConfig) method can host the trampoline ("
         + ("; ".join(rejected[:4]) or "none present") + ")")
@@ -838,7 +857,8 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
     img = BinaryImage(data)
     pcln_off, go_text_va, funcs, hosts = locate_go_functions(img)
     try:
-        funcs = dict(funcs, trampolineHost=choose_trampoline_host(img, funcs, hosts, go_text_va))
+        host, host_ambiguous = choose_trampoline_host(img, funcs, hosts, go_text_va)
+        funcs = dict(funcs, trampolineHost=host)
         plan = build_x86_64_plan(img, funcs) if img.arch == "x86_64" else build_arm64_plan(img, funcs)
     except RuntimeError:
         upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir)
@@ -867,7 +887,11 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
         trampoline = next(c for c in plan["changes"] if c["name"] == "trampolineHost_trampoline")
         entry_after = bytes.fromhex(entry["after"])
         entry_at = int(entry["offset"], 16)
-        original_entry = data[entry_at : entry_at + len(entry_after)] != entry_after
+        # Not carrying our bytes is not proof of an untouched entry: a host whose
+        # prologue is not a stack check (nosplit) needs recorded evidence too.
+        original_entry = (
+            data[entry_at : entry_at + len(entry_after)] != entry_after and not host_ambiguous
+        )
         partial = False
         for change in (entry, trampoline):
             current, patched = bytes.fromhex(change["before"]), bytes.fromhex(change["after"])
