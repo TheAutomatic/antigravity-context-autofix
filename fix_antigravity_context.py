@@ -336,6 +336,14 @@ def externally_referenced(func, sites):
     return any(not (func["va_start"] <= site < func["va_end"]) for site in sites)
 
 
+def entry_has_nop_fill(arch: str, span: bytes) -> bool:
+    """NOPs inside the patched entry bytes mean the prologue was rewritten."""
+    if arch == "arm64":
+        return any(word == 0xD503201F
+                   for (word,) in struct.iter_unpack("<I", span[: len(span) // 4 * 4]))
+    return span.count(b"\x90") >= 2
+
+
 def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_va: int):
     """Pick a body nothing reaches.
 
@@ -366,13 +374,15 @@ def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_v
             continue
         if img.data[func["file_start"] : func["file_start"] + len(noop)] == noop:
             return func, False          # keep an already patched host stable
-        if valid_checkpoint_entry(img, func):
+        span = img.data[func["file_start"] : func["file_start"] + len(noop)]
+        if valid_checkpoint_entry(img, func) and not entry_has_nop_fill(img.arch, span):
             # Switching hosts to dodge an edited prologue would hide the edit.
             return func, first_unclean is not None
         if first_unclean is None:
             first_unclean = func
     if first_unclean is not None:
-        return first_unclean, False     # no stack-checked method: nosplit host
+        # Unrecognised prologue: usable only with recorded evidence.
+        return first_unclean, True
     raise RuntimeError(
         "No unreferenced (*CheckpointConfig) method can host the trampoline ("
         + ("; ".join(rejected[:4]) or "none present") + ")")
@@ -801,18 +811,35 @@ def valid_checkpoint_entry(img, function):
     start, end = function["file_start"], function["file_end"]
     code = img.data[start:end]
     if img.arch == "arm64":
-        if len(code) < 16:
+        if len(code) < 12:
             return False
-        load, sub, compare, branch = struct.unpack_from("<4I", code)
-        # LDR X16,[X28,#16]; SUB X17,SP,#frame; CMP X17,X16; B.LS slow
-        if (load != 0xF9400B90 or sub & 0xFFC003FF != 0xD10003F1 or
-                compare != 0xEB10023F or branch & 0xFF00001F != 0x54000009):
+        words = [struct.unpack_from("<I", code, i * 4)[0] for i in range(min(4, len(code) // 4))]
+        # LDR X16,[X28,#16] opens every variant.
+        if words[0] != 0xF9400B90:
+            return False
+        if len(words) >= 4 and words[1] & 0xFFC003FF == 0xD10003F1:
+            # SUB X17,SP,#frame; CMP X17,X16 | CMP X16,X17; B.LS slow
+            branch_at, compare = 3, words[2]
+        elif words[1] & 0xFFE0FC1F == 0xEB00001F:
+            # Small frames compare SP with X16 directly, without the SUB.
+            branch_at, compare = 2, words[1]
+        else:
+            return False
+        if compare & 0xFFE0FC1F != 0xEB00001F:
+            return False
+        operands = {(compare >> 5) & 0x1F, (compare >> 16) & 0x1F}
+        if operands not in ({16, 31}, {16, 17}):
+            return False
+        if len(words) <= branch_at:
+            return False
+        branch = words[branch_at]
+        if branch & 0xFF00001F != 0x54000009:      # B.LS
             return False
         displacement = (branch >> 5) & 0x7FFFF
         if displacement & 0x40000:
             displacement -= 0x80000
-        destination = 12 + displacement * 4
-        return 16 <= destination < len(code)
+        destination = (branch_at + 1) * 4 + displacement * 4
+        return (branch_at + 1) * 4 <= destination < len(code)
     # CMP RSP,[R14+16] or LEA R12,[RSP-frame]; CMP R12,[R14+16].
     if code.startswith(bytes.fromhex("493b6610")):
         branch_at = 4
@@ -848,6 +875,25 @@ def _try_upgrade_from_verified_backup(target: Path, sha256: str, backup_dir: Pat
                 return bak_info
     except Exception:
         pass
+    return None
+
+
+def recorded_hash_role(target: Path, sha256: str, backup_dir):
+    """'original' or 'patched' when a manifest in the backup directory records it."""
+    if backup_dir is False:
+        return None
+    bdir = backup_dir if isinstance(backup_dir, Path) else (Path.home() / ".gemini" / "agy-patches")
+    if not bdir.is_dir():
+        return None
+    for manifest in sorted(bdir.glob(f"{target.name}-*manifest*.json")):
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if data.get("sha256") == sha256:
+            return "original"
+        if data.get("patched_sha256") == sha256:
+            return "patched"
     return None
 
 
@@ -890,7 +936,10 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
         # Not carrying our bytes is not proof of an untouched entry: a host whose
         # prologue is not a stack check (nosplit) needs recorded evidence too.
         original_entry = (
-            data[entry_at : entry_at + len(entry_after)] != entry_after and not host_ambiguous
+            data[entry_at : entry_at + len(entry_after)] != entry_after
+            and (not host_ambiguous
+                 or backup_dir is False
+                 or recorded_hash_role(target, sha256, backup_dir) == "original")
         )
         partial = False
         for change in (entry, trampoline):
@@ -1237,6 +1286,10 @@ def wait_for_backends(targets):
             raise SystemExit("Cancelled. No backend replaced.")
 
 
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _replace_atomic(source, target):
     """os.replace, retried briefly: antivirus scanners can fail it with WinError 6."""
     for attempt in range(3):
@@ -1244,7 +1297,7 @@ def _replace_atomic(source, target):
             os.replace(source, target)
             return
         except OSError as e:
-            if os.name != "nt" or getattr(e, "winerror", None) != 6 or attempt == 2:
+            if not is_windows() or getattr(e, "winerror", None) != 6 or attempt == 2:
                 raise
             time.sleep(0.2)
 
@@ -1297,7 +1350,7 @@ def replace_with_retry(source, target, expected_sha256, rollback_bytes=None):
             # Some Python builds (Microsoft Store) cannot rename over files under
             # AppData\Local\Programs. Overwrite only when the verified bytes are in
             # hand, so a failed write can be rolled back instead of left truncated.
-            if os.name != "nt" or getattr(e, "winerror", None) != 6:
+            if not is_windows() or getattr(e, "winerror", None) != 6:
                 raise
             if rollback_bytes is None:
                 raise RuntimeError(

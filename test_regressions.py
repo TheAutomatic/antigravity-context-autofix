@@ -90,7 +90,7 @@ class RegressionTests(unittest.TestCase):
 
             with patch.object(f, 'analyze_binary', return_value=plan), \
                  patch.object(f, 'wait_for_backends'), \
-                 patch.object(f.os, 'name', 'nt'), \
+                 patch.object(f, 'is_windows', return_value=True), \
                  patch.object(f, '_replace_atomic', side_effect=WinError6(6, 'invalid handle')), \
                  patch.object(f, '_overwrite_file', side_effect=flaky), \
                  contextlib.redirect_stdout(io.StringIO()):
@@ -112,7 +112,7 @@ class RegressionTests(unittest.TestCase):
             target.write_bytes(b'original')
             source.write_bytes(b'patched')
             with patch.object(f, 'wait_for_backends'), \
-                 patch.object(f.os, 'name', 'nt'), \
+                 patch.object(f, 'is_windows', return_value=True), \
                  patch.object(f, '_replace_atomic', side_effect=WinError6(6, 'invalid handle')):
                 with self.assertRaises(RuntimeError):
                     f.replace_with_retry(source, target, hashlib.sha256(b'original').hexdigest())
@@ -147,6 +147,39 @@ class RegressionTests(unittest.TestCase):
                 chosen, _ = f.choose_trampoline_host(img, {}, hosts, 0x1000)
                 self.assertEqual(chosen['symbol'], 'google3/x.(*CheckpointConfig).SetB')
                 self.assertEqual(chosen['va_start'], 0x1190)
+
+    def test_arm64_prologue_layouts_are_recognised(self):
+        # Both prologues start with LDR X16,[X28,#16]; small frames compare SP
+        # directly instead of subtracting the frame first.
+        target = 0x60
+        branch = (lambda at: 0x54000009 | (((target - (at + 4)) >> 2 & 0x7FFFF) << 5))
+        layouts = (([0xF9400B90, 0xD10003F1, 0xEB10023F, branch(12)], 3),
+                   ([0xF9400B90, 0xEB1003FF, branch(8)], 2),
+                   ([0xF9400B90, 0xEB1003FF, branch(8), 0xD503201F], 2))
+        for words, prologue_words in layouts:
+            def image(seq):
+                code = struct.pack(f"<{len(seq)}I", *seq) + b"\x1f\x20\x03\xd5" * 32
+                func = {'symbol': 'x', 'va_start': 0x1000, 'va_end': 0x1000 + len(code),
+                        'file_start': 0, 'file_end': len(code)}
+                return _FakeImage('arm64', code,
+                                  [('__TEXT', 0x1000, len(code), 0, len(code), True)]), func
+
+            img, func = image(words)
+            self.assertTrue(f.valid_checkpoint_entry(img, func), [hex(w) for w in words])
+            for i in range(prologue_words + 1):
+                tampered = list(words)
+                tampered[i] = 0xD503201F
+                img_bad, func_bad = image(tampered)
+                self.assertFalse(f.valid_checkpoint_entry(img_bad, func_bad), i)
+            # A NOP past the validated prologue is caught by the entry scan.
+            self.assertEqual(f.entry_has_nop_fill('arm64', img.data[:len(words) * 4]),
+                             words[-1] == 0xD503201F)
+
+    def test_nop_fill_in_entry_counts_as_rewritten(self):
+        self.assertTrue(f.entry_has_nop_fill('arm64', bytes.fromhex('1f2003d5')))
+        self.assertFalse(f.entry_has_nop_fill('arm64', bytes.fromhex('900bf940')))
+        self.assertTrue(f.entry_has_nop_fill('x86_64', bytes.fromhex('493b66109090')))
+        self.assertFalse(f.entry_has_nop_fill('x86_64', bytes.fromhex('493b66100f86')))
 
     def test_host_reference_scan_sees_backward_branches(self):
         text_va, text_off, size = 0x1000, 0x400, 0x400
