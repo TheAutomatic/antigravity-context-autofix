@@ -8,7 +8,7 @@ Patch the local Antigravity backend to raise the Argon High / Medium / Low reque
 
 | System | Backend architecture / format | Intended clients | Validation |
 |---|---|---|---|
-| Windows | x86_64 / PE | Antigravity IDE, Antigravity Desktop, agy CLI | Locally verified on IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) and Desktop (`language_server.exe` CL 1009437749 & 1013060670): patching, startup and new request window |
+| Windows | x86_64 / PE | Antigravity IDE, Antigravity Desktop, agy CLI | Locally verified on IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) and Desktop (`language_server.exe`): patching, startup and new request window |
 | Windows | ARM64 / PE | Outside the expected scope for now | Unvalidated; compatibility is not guaranteed |
 | Linux | x86_64 / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
 | Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
@@ -168,7 +168,7 @@ Inspection exits 0 if all selected binaries match, 2 if none found or any incomp
 
 ## Validation and tests
 
-See the opening table for validation on actual installations: on Windows (`agy.exe` 1.4.12 / 1.5.0 and `language_server.exe` CL 1009437749 / 1013060670), the **900000** window patch, startup, repeated automatic `<CONTEXT_SUMMARY>` compaction at 800K–900K tokens (dropping back to ~20K tokens across 4 cycles in a 1000+ turn session), and live usage progress bars have all been verified on live sessions. On macOS (IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64), signing and startup were verified under the earlier 983040 scheme; the 900000 + native auto-compaction scheme is covered by unit tests and awaits live Mac re-verification.
+See the opening table for validation on actual installations: on Windows (`agy.exe` 1.4.12 / 1.5.0 and `language_server.exe`), the **900000** window patch, startup, repeated automatic `<CONTEXT_SUMMARY>` compaction at 800K–900K tokens (dropping back to ~20K tokens across 4 cycles in a 1000+ turn session), and live usage progress bars have all been verified on live sessions. On macOS (IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64), signing and startup were verified under the earlier 983040 scheme; the 900000 + native auto-compaction scheme is covered by unit tests and awaits live Mac re-verification.
 
 ```bash
 python3 -m unittest discover -s scripts -v

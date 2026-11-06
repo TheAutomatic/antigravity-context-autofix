@@ -8,7 +8,7 @@
 
 | 系统 | 后端架构 / 格式 | 预期适用客户端 | 验证情况 |
 |---|---|---|---|
-| Windows | x86_64 / PE | Antigravity IDE、Antigravity Desktop、agy CLI | 本机 IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) 与 Desktop (`language_server.exe` CL 1009437749 & 1013060670) 已实测修改、启动与新请求窗口 |
+| Windows | x86_64 / PE | Antigravity IDE、Antigravity Desktop、agy CLI | 本机 IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) 与 Desktop (`language_server.exe`) 已实测修改、启动与新请求窗口 |
 | Windows | ARM64 / PE | 暂不列入预期范围 | 未验证，不保证适配 |
 | Linux | x86_64 / ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
 | Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
@@ -172,7 +172,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 
 ## 验证与测试
 
-实机验证范围见开头表格：Windows 本机（`agy.exe` 1.4.12 / 1.5.0 与 `language_server.exe` CL 1009437749 / 1013060670）已完成 900000 窗口修改、启动、单会话超 1000 轮连续 4 次在 80 万~90 万 Token 自动触发 `<CONTEXT_SUMMARY>` 压缩回落至 ~2 万 Token及实时进度条查询验证。macOS 端（IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64）此前已验证旧版 983040 跳板方案的签名与启动，新版 900000 + 保留原生自动压缩方案已通过架构单测，待 Mac 实机复核。
+实机验证范围见开头表格：Windows 本机（`agy.exe` 1.4.12 / 1.5.0 与 `language_server.exe`）已完成 900000 窗口修改、启动、单会话超 1000 轮连续 4 次在 80 万~90 万 Token 自动触发 `<CONTEXT_SUMMARY>` 压缩回落至 ~2 万 Token及实时进度条查询验证。macOS 端（IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64）此前已验证旧版 983040 跳板方案的签名与启动，新版 900000 + 保留原生自动压缩方案已通过架构单测，待 Mac 实机复核。
 
 ```bash
 python3 -m unittest discover -s scripts -v
