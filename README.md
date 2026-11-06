@@ -172,7 +172,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 
 ## 验证与测试
 
-实机验证范围见开头表格：Windows 本机（`agy.exe` 1.4.12 / 1.5.0 与 `language_server.exe` CL 1009437749 / 1013060670）已完成 900000 窗口修改、启动、长会话超 87 万 Token 自动触发 `<CONTEXT_SUMMARY>` 压缩回落及实时进度条查询验证。macOS 端（IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64）此前已验证旧版 983040 跳板方案的签名与启动，新版 900000 + 保留原生自动压缩方案已通过架构单测，待 Mac 实机复核。
+实机验证范围见开头表格：Windows 本机（`agy.exe` 1.4.12 / 1.5.0 与 `language_server.exe` CL 1009437749 / 1013060670）已完成 900000 窗口修改、启动、单会话超 1000 轮连续 4 次在 80 万~90 万 Token 自动触发 `<CONTEXT_SUMMARY>` 压缩回落至 ~2 万 Token及实时进度条查询验证。macOS 端（IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64）此前已验证旧版 983040 跳板方案的签名与启动，新版 900000 + 保留原生自动压缩方案已通过架构单测，待 Mac 实机复核。
 
 ```bash
 python3 -m unittest discover -s scripts -v
