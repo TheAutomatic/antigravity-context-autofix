@@ -15,6 +15,18 @@ import verify_session as v
 from test_status import field, varint
 
 
+class _FakeImage:
+    """Minimal BinaryImage stand-in for synthetic instruction encodings."""
+
+    def __init__(self, arch, data, segments):
+        self.arch, self.data, self.segments = arch, data, segments
+
+    def va_to_file(self, va):
+        for _, sva, _, raw_ptr, raw_size, _ in self.segments:
+            if sva <= va < sva + raw_size:
+                return raw_ptr + (va - sva)
+        raise ValueError(f"unmapped VA {hex(va)}")
+
 class RegressionTests(unittest.TestCase):
     def test_inplace_replacement_restores_target_on_failure(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -43,6 +55,51 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b'patched-bytes')
             self.assertFalse(source.exists())
 
+    def test_upgrade_rollback_restores_pre_upgrade_binary(self):
+        class WinError6(OSError):
+            winerror = 6
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target, backup_dir = root / 'agy.exe', root / 'backups'
+            backup_dir.mkdir()
+            current = b'legacy-patched-bytes'
+            original = b'pristine-bytes-longer'
+            bak = backup_dir / 'agy.exe-unknown-original-0000000000000000.bak'
+            bak.write_bytes(original)
+            target.write_bytes(current)
+            plan = {
+                'path': str(target), 'format': 'PE', 'arch': 'x86_64', 'size': len(original),
+                'sha256': hashlib.sha256(original).hexdigest(),
+                'pclntab_offset': '0x0', 'go_text_va': '0x0', 'status': 'UNPATCHED',
+                'field_offsets': {}, 'functions': {},
+                'changes': [{'name': 'x', 'purpose': 'test', 'va': '0x0', 'offset': '0x0',
+                             'before': '70', 'after': '58', 'fixed_before': True}],
+                'target_disk_sha256': hashlib.sha256(current).hexdigest(),
+                'upgrade_from_backup': str(bak),
+            }
+            real_write = f._overwrite_file
+            writes = []
+
+            def flaky(dest, payload):
+                writes.append(payload)
+                if len(writes) == 1:
+                    dest.write_bytes(b'partial')
+                    raise OSError(28, 'No space left on device')
+                real_write(dest, payload)
+
+            with patch.object(f, 'analyze_binary', return_value=plan), \
+                 patch.object(f, 'wait_for_backends'), \
+                 patch.object(f, '_replace_atomic', side_effect=WinError6(6, 'invalid handle')), \
+                 patch.object(f, '_overwrite_file', side_effect=flaky), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(OSError):
+                    f.patch_target(target, backup_dir)
+            # An interrupted upgrade must leave the installed patched build in place,
+            # not silently roll back to the pristine original.
+            self.assertEqual(target.read_bytes(), current)
+            self.assertEqual(writes[-1], current)
+
     def test_replace_refuses_truncating_write_without_rollback(self):
         class WinError6(OSError):
             winerror = 6
@@ -59,17 +116,72 @@ class RegressionTests(unittest.TestCase):
                     f.replace_with_retry(source, target, hashlib.sha256(b'original').hexdigest())
             self.assertEqual(target.read_bytes(), b'original')
 
+    def test_host_reference_scan_sees_tail_jumps_and_ignores_self_branches(self):
+        # A is smaller, so it is considered first; a tail jump from elsewhere must
+        # disqualify it even though its body is never CALLed. B is only reached by a
+        # jump from inside itself, which leaves it usable.
+        def build(arch):
+            text_va, text_off, size = 0x1000, 0x400, 0x400
+            data = bytearray(0x1000)
+            a_va, b_va = 0x1100, 0x1190
+            if arch == 'x86_64':
+                data[text_off + 0x20] = 0xE9                       # jmp A from outside
+                struct.pack_into('<i', data, text_off + 0x21, a_va - (text_va + 0x20 + 5))
+                data[text_off + 0x1A0] = 0xE9                      # jmp B from inside B
+                struct.pack_into('<i', data, text_off + 0x1A1, b_va - (text_va + 0x1A0 + 5))
+            else:
+                struct.pack_into('<I', data, text_off + 0x20,
+                                 0x14000000 | (((a_va - (text_va + 0x20)) >> 2) & 0x03FFFFFF))
+                struct.pack_into('<I', data, text_off + 0x1A0,
+                                 0x14000000 | (((b_va - (text_va + 0x1A0)) >> 2) & 0x03FFFFFF))
+            return _FakeImage(arch, bytes(data),
+                              [('__TEXT', text_va, size, text_off, size, True)])
+
+        for arch in ('x86_64', 'arm64'):
+            with self.subTest(arch=arch):
+                img = build(arch)
+                hosts = {'google3/x.(*CheckpointConfig).SetA': (0x100, 0x190),
+                         'google3/x.(*CheckpointConfig).SetB': (0x190, 0x290)}
+                chosen = f.choose_trampoline_host(img, {}, hosts, 0x1000)
+                self.assertEqual(chosen['symbol'], 'google3/x.(*CheckpointConfig).SetB')
+                self.assertEqual(chosen['va_start'], 0x1190)
+
+    def test_host_reference_scan_ignores_debug_addresses_but_not_data(self):
+        text_va, text_off, size = 0x1000, 0x400, 0x400
+        func_va = 0x1100
+        hosts = {'google3/x.(*CheckpointConfig).SetA': (0x100, 0x200)}
+        stored = struct.pack('<Q', func_va)
+
+        debugging = bytearray(0x1000)
+        debugging[0x800:0x808] = stored
+        img = _FakeImage('x86_64', bytes(debugging),
+                         [('__TEXT', text_va, size, text_off, size, True),
+                          ('__DWARF', 0x2000, 0x100, 0x800, 0x100, False)])
+        self.assertEqual(f.choose_trampoline_host(img, {}, hosts, text_va)['va_start'], func_va)
+
+        data = bytearray(debugging)
+        data[0x900:0x908] = stored
+        img = _FakeImage('x86_64', bytes(data),
+                         [('__TEXT', text_va, size, text_off, size, True),
+                          ('__DWARF', 0x2000, 0x100, 0x800, 0x100, False),
+                          ('__DATA', 0x2100, 0x100, 0x900, 0x100, False)])
+        with self.assertRaises(RuntimeError):
+            f.choose_trampoline_host(img, {}, hosts, text_va)
+
     @unittest.skipUnless(os.environ.get('AGY_TEST_BINARY'), 'provide an original binary fixture')
     def test_trampoline_host_falls_back_when_preferred_symbols_are_absent(self):
         source = Path(os.environ['AGY_TEST_BINARY'])
         img = f.BinaryImage(source.read_bytes())
         _, text_va, funcs, hosts = f.locate_go_functions(img)
-        preferred = f.choose_trampoline_host(img, funcs, hosts, text_va)
-        self.assertTrue(preferred['symbol'].endswith(f.HOST_PREFERENCE[0]))
+        chosen = f.choose_trampoline_host(img, funcs, hosts, text_va)
+        self.assertIn(chosen['symbol'], hosts)
+        self.assertGreaterEqual(chosen['file_end'] - chosen['file_start'], f.HOST_SPAN[img.arch])
+        if any(n.endswith(f.HOST_PREFERENCE[0]) for n in hosts):
+            self.assertTrue(chosen['symbol'].endswith(f.HOST_PREFERENCE[0]))
         reduced = {n: v for n, v in hosts.items() if not n.endswith(f.HOST_PREFERENCE)}
         fallback = f.choose_trampoline_host(img, funcs, reduced, text_va)
-        self.assertNotEqual(fallback['symbol'], preferred['symbol'])
-        self.assertGreaterEqual(fallback['file_end'] - fallback['file_start'], f.HOST_MIN_BYTES)
+        self.assertIn(fallback['symbol'], reduced)
+        self.assertGreaterEqual(fallback['file_end'] - fallback['file_start'], f.HOST_SPAN[img.arch])
         # Builds without any CheckpointConfig method must fail, never fall back to
         # hooks.checkpointNeeded, which hosts native auto-compaction.
         with self.assertRaises(RuntimeError):

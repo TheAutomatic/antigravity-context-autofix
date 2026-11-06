@@ -55,11 +55,14 @@ HOST_PREFERENCE = (
     "(*CheckpointConfig).SetCheckpointPromptOverride",
     "(*CheckpointConfig).SetContinuationPromptOverride",
 )
-HOST_MIN_BYTES = 128
+HOST_SPAN = {"x86_64": 0x20 + 46, "arm64": 0x20 + 48}  # entry + 0x20 + trampoline
 HOST_NOOP_ENTRY = {
     "x86_64": bytes.fromhex("31c031db31c9c3"),
     "arm64": struct.pack("<4I", 0xD2800000, 0xD2800001, 0xD2800002, 0xD65F03C0),
 }
+# Debug sections store absolute function VAs, so they are not references.
+DATA_SEGMENT_SKIP = ("__DWARF", "__LINKEDIT", "__eh_frame", ".debug", ".zdebug",
+                     ".reloc", ".rela", ".rsrc", ".symtab", ".strtab", ".comment", ".note")
 
 ARGON_MAX_TOKEN_LIMIT = 900000
 
@@ -267,54 +270,88 @@ def go_text_bounds(img: BinaryImage, go_text_va: int):
     raise RuntimeError("Go text is not inside an executable segment")
 
 
-def has_direct_call(img: BinaryImage, go_text_va: int, func_va: int):
-    """Conservative reachability scan: any relative branch or stored VA rejects the host."""
+def maybe_sign_extend(value, bits):
+    sign = 1 << (bits - 1)
+    return value - (sign << 1) if value & sign else value
+
+
+def collect_text_references(img: BinaryImage, go_text_va: int, wanted):
+    """Map each wanted VA to the instructions that branch to it, direct only."""
+    if not wanted:
+        return {}
     lo, hi, delta = go_text_bounds(img, go_text_va)
     data = img.data
-    if data.find(struct.pack("<Q", func_va)) != -1:
-        return True  # Funcval or table entry: the body may be invoked indirectly.
+    sites = {}
+
+    def note(target, site):
+        if target in wanted:
+            sites.setdefault(target, []).append(site)
+
     if img.arch == "x86_64":
-        pos = lo
-        while True:
-            pos = data.find(b"\xe8", pos, hi - 4)
-            if pos < 0:
-                return False
-            if pos + delta + 5 + struct.unpack_from("<i", data, pos + 1)[0] == func_va:
-                return True
-            pos += 1
-    for index, (word,) in enumerate(struct.iter_unpack("<I", memoryview(data)[lo:hi - (hi - lo) % 4])):
-        if word & 0xFC000000 != 0x94000000:
+        # CALL rel32, JMP rel32 and JMP rel8: a tail call leaves no other trace.
+        for opcode, length, fmt in ((b"\xe8", 5, "<i"), (b"\xe9", 5, "<i"), (b"\xeb", 2, "<b")):
+            pos = lo
+            while True:
+                pos = data.find(opcode, pos, hi - length)
+                if pos < 0:
+                    break
+                note(pos + delta + length + struct.unpack_from(fmt, data, pos + 1)[0], pos + delta)
+                pos += 1
+        return sites
+    # Only words whose top byte can start B / BL / B.cond / CBZ / CBNZ are decoded.
+    span = (hi - lo) // 4 * 4
+    msb = bytes(memoryview(data)[lo : lo + span][3::4])
+    for value in (0x14, 0x94, 0x54, 0x34, 0x35, 0xB4, 0xB5):
+        index = msb.find(value)
+        while index >= 0:
+            offset = lo + index * 4
+            word, site = struct.unpack_from("<I", data, offset)[0], offset + delta
+            if word & 0x7C000000 == 0x14000000:                     # B / BL
+                note(site + maybe_sign_extend(word & 0x03FFFFFF, 26) * 4, site)
+            elif word & 0xFF000010 == 0x54000000:                   # B.cond
+                note(site + maybe_sign_extend((word >> 5) & 0x7FFFF, 19) * 4, site)
+            elif word & 0x7E000000 == 0x34000000:                   # CBZ / CBNZ
+                note(site + maybe_sign_extend((word >> 5) & 0x7FFFF, 19) * 4, site)
+            index = msb.find(value, index + 1)
+    return sites
+
+
+def stored_address_present(img: BinaryImage, func_va: int):
+    """True if a data word holds this VA: funcval, itab or table entry."""
+    needle = struct.pack("<Q", func_va)
+    for name, _, _, raw_ptr, raw_size, is_exec in img.segments:
+        if is_exec or not raw_size or name.startswith(DATA_SEGMENT_SKIP):
             continue
-        imm = word & 0x03FFFFFF
-        if imm & 0x02000000:
-            imm -= 0x04000000
-        if lo + index * 4 + delta + imm * 4 == func_va:
+        if img.data.find(needle, raw_ptr, raw_ptr + raw_size) != -1:
             return True
     return False
 
 
+def externally_referenced(func, sites):
+    """References from outside the body count; a tail jump inside it does not."""
+    return any(not (func["va_start"] <= site < func["va_end"]) for site in sites)
+
+
 def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_va: int):
-    """Pick a function body that is never called and large enough for the trampoline."""
+    """Pick a body that nothing reaches and that is big enough for the trampoline."""
     if not hosts:
         raise RuntimeError("No (*CheckpointConfig) method is available to host the trampoline")
     required = {f["symbol"] for f in funcs.values()}
-    noop = HOST_NOOP_ENTRY[img.arch]
+    candidates = [n for n in order_host_candidates(hosts) if n not in required]
+    records = {n: describe_function(img, go_text_va, n, *hosts[n]) for n in candidates}
+    references = collect_text_references(img, go_text_va, {r["va_start"] for r in records.values()})
     rejected = []
-    for symbol in order_host_candidates(hosts):
-        entry_off, end_off = hosts[symbol]
-        func = describe_function(img, go_text_va, symbol, entry_off, end_off)
+    for name in candidates:
+        func = records[name]
         size = func["file_end"] - func["file_start"]
-        if symbol in required:
+        if size < HOST_SPAN[img.arch]:
+            rejected.append(f"{name}: {size} bytes")
             continue
-        if size < HOST_MIN_BYTES:
-            rejected.append(f"{symbol}: {size} bytes")
+        if externally_referenced(func, references.get(func["va_start"], ())):
+            rejected.append(f"{name}: branched to")
             continue
-        patched = img.data[func["file_start"] : func["file_start"] + len(noop)] == noop
-        if not patched and not valid_checkpoint_entry(img, func):
-            rejected.append(f"{symbol}: no Go stack check")
-            continue
-        if has_direct_call(img, go_text_va, func["va_start"]):
-            rejected.append(f"{symbol}: referenced")
+        if stored_address_present(img, func["va_start"]):
+            rejected.append(f"{name}: address stored")
             continue
         return func
     raise RuntimeError(
@@ -353,7 +390,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
         raise RuntimeError("Could not uniquely locate epilogue (31 c9 c9 c3) in applyFeatureProviderCheckpointOverrideConfig")
 
     f_chk = funcs["trampolineHost"]
-    if f_chk["file_end"] - f_chk["file_start"] < HOST_MIN_BYTES:
+    if f_chk["file_end"] - f_chk["file_start"] < HOST_SPAN[img.arch]:
         raise RuntimeError(f"{f_chk['symbol']} is too small to host the trampoline")
     chk_va = f_chk["va_start"]
     chk_foff = f_chk["file_start"]
@@ -599,7 +636,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
     b_apply = fbytes("applyOverride")
     f_apply = funcs["applyOverride"]
     f_chk = funcs["trampolineHost"]
-    if f_chk["file_end"] - f_chk["file_start"] < HOST_MIN_BYTES:
+    if f_chk["file_end"] - f_chk["file_start"] < HOST_SPAN[img.arch]:
         raise RuntimeError(f"{f_chk['symbol']} is too small to host the trampoline")
     chk_va = f_chk["va_start"]
     chk_foff = f_chk["file_start"]
@@ -828,7 +865,9 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
         # Variable original bytes must not hide an interrupted trampoline patch.
         entry = next(c for c in plan["changes"] if c["name"] == "trampolineHost_entry")
         trampoline = next(c for c in plan["changes"] if c["name"] == "trampolineHost_trampoline")
-        original_entry = valid_checkpoint_entry(img, funcs["trampolineHost"])
+        entry_after = bytes.fromhex(entry["after"])
+        entry_at = int(entry["offset"], 16)
+        original_entry = data[entry_at : entry_at + len(entry_after)] != entry_after
         partial = False
         for change in (entry, trampoline):
             current, patched = bytes.fromhex(change["before"]), bytes.fromhex(change["after"])
@@ -974,9 +1013,12 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_file = backup_dir / f"{target.name}-{ver}-original-{info['sha256'][:16]}.bak"
     target_disk_sha256 = info.get("target_disk_sha256", info["sha256"])
-    if hashlib.sha256(target.read_bytes()).hexdigest() != target_disk_sha256:
+    # Rollback must restore what is on disk now, which differs from the original
+    # bytes when upgrading a binary that still carries the previous patch.
+    rollback_bytes = target.read_bytes()
+    if hashlib.sha256(rollback_bytes).hexdigest() != target_disk_sha256:
         raise RuntimeError("Backend changed during analysis; rerun before patching")
-    raw_bytes = Path(info["upgrade_from_backup"]).read_bytes() if info.get("upgrade_from_backup") else target.read_bytes()
+    raw_bytes = Path(info["upgrade_from_backup"]).read_bytes() if info.get("upgrade_from_backup") else rollback_bytes
     if hashlib.sha256(raw_bytes).hexdigest() != info["sha256"]:
         raise RuntimeError("Original source bytes failed SHA256 verification")
     if backup_file.exists():
@@ -1042,7 +1084,7 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
         previous_manifest = manifest_file.read_bytes() if manifest_file.exists() else None
         write_manifest(manifest_file, info)
         try:
-            replace_with_retry(tmp_path, target, target_disk_sha256, rollback_bytes=raw_bytes)
+            replace_with_retry(tmp_path, target, target_disk_sha256, rollback_bytes=rollback_bytes)
         except BaseException:
             if hashlib.sha256(target.read_bytes()).hexdigest() != patched_sha256:
                 if previous_manifest is None:
