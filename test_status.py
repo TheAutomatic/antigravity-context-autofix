@@ -1,3 +1,5 @@
+import contextlib
+import io
 import sqlite3
 import os
 import tempfile
@@ -41,6 +43,21 @@ class StatusTests(unittest.TestCase):
              patch.object(Path, 'exists', return_value=True):
             f.main()
         modify.assert_called_once()
+
+    def test_retention_choice_controls_pruning(self):
+        target = Path('agy').resolve()
+        report = {'compatible': True, 'binaries': [{'path': str(target), 'status': 'UNPATCHED'}]}
+        for answer, expected in (('', True), ('2', False)):
+            with patch('sys.argv', ['fix', '--target', str(target)]), \
+                 patch.object(f, 'preflight', return_value=report), \
+                 patch('builtins.input', side_effect=['Y', answer]), \
+                 patch.object(f, 'wait_for_backends'), \
+                 patch.object(f, 'patch_target', return_value={'path': str(target)}), \
+                 patch.object(f, 'prune_old_backups', return_value=[]) as prune, \
+                 patch.object(Path, 'exists', return_value=True), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                f.main()
+            self.assertEqual(prune.called, expected, answer)
 
     def test_read_only_and_already_patched_never_prompt(self):
         target = Path('agy').resolve()

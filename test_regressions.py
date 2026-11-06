@@ -163,7 +163,7 @@ class RegressionTests(unittest.TestCase):
         for words, prologue_words in (([0xF9400B90, 0xD10003F1, 0xEB10023F, branch(12, 0x40)], 3),
                                       ([0xF9400B90, 0xEB3063FF, branch(8, 0x40)], 2),
                                       ([0xF9400B90, 0xEB3063FF, branch(8, 0x40), 0xD503201F], 2)):
-            img, func, size = image(words)
+            img, func, _ = image(words)
             self.assertTrue(f.valid_checkpoint_entry(img, func), [hex(w) for w in words])
             for i in range(prologue_words + 1):
                 tampered = list(words)
@@ -171,8 +171,8 @@ class RegressionTests(unittest.TestCase):
                 img_bad, func_bad, _ = image(tampered)
                 self.assertFalse(f.valid_checkpoint_entry(img_bad, func_bad), i)
             # A NOP past the validated prologue is caught by the entry scan.
-            self.assertEqual(f.entry_has_nop_fill('arm64', words and struct.pack(f"<{len(words)}I", *words)),
-                             words[-1] == 0xD503201F)
+            packed = struct.pack(f"<{len(words)}I", *words)
+            self.assertEqual(f.entry_has_nop_fill('arm64', packed), words[-1] == 0xD503201F)
 
         # B.cond is relative to the branch itself: a self loop is refused, and a
         # jump to the last instruction is accepted.
@@ -186,6 +186,8 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(f.is_subs_zero(0xEB10023F))   # SUBS XZR, X17, X16
         self.assertFalse(f.is_subs_zero(0xD10003F1))  # SUB X17, SP, #frame
         self.assertFalse(f.is_subs_zero(0xEB10023E))  # Rd is X30, not XZR
+        self.assertFalse(f.is_subs_zero(0xEB307FFF))  # extended shift 7 is unallocated
+        self.assertFalse(f.is_subs_zero(0xEB107FFF))  # shifted form with imm6 != 0
 
     def test_retention_prompt_defaults_to_pruning(self):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -225,15 +227,30 @@ class RegressionTests(unittest.TestCase):
             stray_man = bdir / 'agy.exe-0.8-manifest-eeee.json'
             stray_man.write_text(json.dumps({'sha256': 's', 'patched_sha256': 't',
                                              'backup_path': str(outside)}))
+            # A second installation with the same binary name, an incomplete record
+            # and a non-string hash must all survive untouched.
+            other_install = root / 'portable' / 'agy.exe'
+            other_install.parent.mkdir()
+            other_install.write_bytes(b'another-build')
+            other_man2 = bdir / 'agy.exe-0.7-manifest-ffff.json'
+            other_man2.write_text(json.dumps({'path': str(other_install), 'sha256': 'u',
+                                              'patched_sha256': 'v', 'backup_path': str(other_install)}))
+            incomplete_man = bdir / 'agy.exe-0.6-manifest-gggg.json'
+            incomplete_man.write_text(json.dumps({'backup_path': str(old_bak)}))
+            listy_man = bdir / 'agy.exe-0.5-manifest-hhhh.json'
+            listy_man.write_text(json.dumps({'sha256': ['x'], 'patched_sha256': ['y']}))
 
             freed_expected = sum(p.stat().st_size for p in (old_man, old_bak, stray_man))
-            removed = f.prune_old_backups(bdir, [target])
+            # An aliased path resolves to the same directory; macOS /var ->
+            # /private/var does the same, and pruning must still work.
+            removed = f.prune_old_backups(bdir / '..' / 'backups', [target])
             self.assertEqual(sorted(p.name for p, _ in removed),
                              ['agy.exe-0.8-manifest-eeee.json',
                               'agy.exe-1.0-manifest-bbbb.json',
                               'agy.exe-1.0-original-bbbb.bak'])
             self.assertTrue(new_bak.exists() and new_man.exists())
             self.assertTrue(other_man.exists() and outside.exists())
+            self.assertTrue(other_man2.exists() and incomplete_man.exists() and listy_man.exists())
             self.assertFalse(old_bak.exists() or old_man.exists())
             self.assertEqual(sum(size for _, size in removed), freed_expected)
 

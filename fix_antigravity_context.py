@@ -806,13 +806,22 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
     }
 
 
-def is_subs_zero(word: int) -> bool:
-    """SUBS XZR, Rn, Rm in either the shifted or the extended-register form.
+def subs_zero_form(word: int):
+    """"shifted" or "extended" for SUBS XZR,Rn,Rm, else None.
 
     SP is only encodable in the extended form, which is what CMP SP, X16 uses
-    (0xEB3063FF on real builds), so both encodings must be accepted.
+    (0xEB3063FF on real builds). That form only allocates shifts up to four, so
+    the extension field is checked rather than masked away.
     """
-    return word & 0xFFE0001F in (0xEB00001F, 0xEB20001F)
+    if word & 0xFFE0001F == 0xEB00001F and (word >> 10) & 0x3F == 0:
+        return "shifted"      # imm6 = 0
+    if word & 0xFFE0001F == 0xEB20001F and (word >> 10) & 0x3F == 0x18:
+        return "extended"     # option=UXTX, imm3=0
+    return None
+
+
+def is_subs_zero(word: int) -> bool:
+    return subs_zero_form(word) is not None
 
 
 def valid_checkpoint_entry(img, function):
@@ -834,10 +843,13 @@ def valid_checkpoint_entry(img, function):
             branch_at, compare = 2, words[1]
         else:
             return False
-        if not is_subs_zero(compare):
+        form = subs_zero_form(compare)
+        if form is None:
             return False
         operands = {(compare >> 5) & 0x1F, (compare >> 16) & 0x1F}
-        if operands not in ({16, 31}, {16, 17}):
+        # Register 31 is SP only in the extended form; in the shifted form it is
+        # XZR, which would not compare the stack pointer at all.
+        if operands not in (({16, 31}, {16, 17}) if form == "extended" else ({16, 17},)):
             return False
         if len(words) <= branch_at:
             return False
@@ -1654,22 +1666,28 @@ def confirm_backup_retention() -> bool:
 
 
 def prune_old_backups(backup_dir: Path, targets) -> list:
-    """Remove original/manifest pairs that cannot restore any current target.
+    """Remove original/manifest pairs that cannot restore any installed build.
 
-    A manifest survives when its original or patched hash matches a binary that
-    is still installed. Unreadable manifests, names without a current target and
-    paths outside the backup directory are left untouched.
+    Only proven-stale records are removed. A pair survives when its original or
+    patched hash matches an installed binary, when its manifest names another
+    installation that still exists, or when the record is incomplete; paths
+    outside the backup directory are never touched.
     """
-    if not backup_dir.is_dir():
+    # Resolve once: macOS maps /var to /private/var, so an unresolved caller path
+    # would never be a prefix of the resolved file paths below.
+    base = backup_dir.resolve()
+    if not base.is_dir():
         return []
-    current = {}
+    installed, current = set(), {}
     for target in targets:
         try:
-            current.setdefault(target.name, set()).add(hashlib.sha256(target.read_bytes()).hexdigest())
+            resolved = target.resolve()
+            current.setdefault(resolved.name, set()).add(hashlib.sha256(resolved.read_bytes()).hexdigest())
         except OSError:
             continue
+        installed.add(resolved)
     entries = []
-    for manifest in sorted(backup_dir.glob("*manifest*.json")):
+    for manifest in sorted(base.glob("*manifest*.json")):
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1680,28 +1698,46 @@ def prune_old_backups(backup_dir: Path, targets) -> list:
     for manifest, data in entries:
         hashes = current.get(manifest.name.split("-", 1)[0])
         if not hashes:
-            continue
-        if data.get("patched_sha256") in hashes or data.get("sha256") in hashes:
-            keep.add(manifest)
-            if data.get("backup_path"):
-                keep.add(Path(data["backup_path"]))
-        else:
-            stale.append((manifest, data))
-    removed = []
-    for manifest, data in stale:
-        candidates = [manifest]
-        if data.get("backup_path"):
-            candidates.append(Path(data["backup_path"]))
-        for path in candidates:
+            continue            # no such binary installed here: not ours to judge
+        backup_path = Path(data["backup_path"]) if isinstance(data.get("backup_path"), str) else None
+        recorded = data.get("path")
+        if isinstance(recorded, str):
             try:
-                path.resolve().relative_to(backup_dir)
+                recorded_path = Path(recorded).resolve()
+            except (OSError, ValueError):
+                recorded_path = None
+            if recorded_path is not None and recorded_path not in installed and recorded_path.exists():
+                # Another installation shares this binary name and was not inspected.
+                keep.add(manifest)
+                if backup_path:
+                    keep.add(backup_path)
+                continue
+        original, patched = data.get("sha256"), data.get("patched_sha256")
+        if not isinstance(original, str) and not isinstance(patched, str):
+            continue            # incomplete record: cannot be proven stale
+        if ((isinstance(patched, str) and patched in hashes)
+                or (isinstance(original, str) and original in hashes)):
+            keep.add(manifest)
+            if backup_path:
+                keep.add(backup_path)
+        else:
+            stale.append((manifest, backup_path))
+    keep_resolved = {p.resolve() for p in keep}
+    removed = []
+    for manifest, backup_path in stale:
+        for path in (manifest, backup_path):
+            if path is None:
+                continue
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(base)
             except (OSError, ValueError):
                 continue
-            if path in keep or not path.exists():
+            if resolved in keep_resolved or not resolved.exists():
                 continue
             try:
-                size = path.stat().st_size
-                path.unlink()
+                size = resolved.stat().st_size
+                resolved.unlink()
             except OSError:
                 continue
             removed.append((path, size))
