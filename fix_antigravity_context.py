@@ -806,6 +806,15 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
     }
 
 
+def is_subs_zero(word: int) -> bool:
+    """SUBS XZR, Rn, Rm in either the shifted or the extended-register form.
+
+    SP is only encodable in the extended form, which is what CMP SP, X16 uses
+    (0xEB3063FF on real builds), so both encodings must be accepted.
+    """
+    return word & 0xFFE0001F in (0xEB00001F, 0xEB20001F)
+
+
 def valid_checkpoint_entry(img, function):
     """Validate the supported Go stack-check sequence, including its branch."""
     start, end = function["file_start"], function["file_end"]
@@ -820,12 +829,12 @@ def valid_checkpoint_entry(img, function):
         if len(words) >= 4 and words[1] & 0xFFC003FF == 0xD10003F1:
             # SUB X17,SP,#frame; CMP X17,X16 | CMP X16,X17; B.LS slow
             branch_at, compare = 3, words[2]
-        elif words[1] & 0xFFE0FC1F == 0xEB00001F:
+        elif is_subs_zero(words[1]):
             # Small frames compare SP with X16 directly, without the SUB.
             branch_at, compare = 2, words[1]
         else:
             return False
-        if compare & 0xFFE0FC1F != 0xEB00001F:
+        if not is_subs_zero(compare):
             return False
         operands = {(compare >> 5) & 0x1F, (compare >> 16) & 0x1F}
         if operands not in ({16, 31}, {16, 17}):
@@ -835,11 +844,10 @@ def valid_checkpoint_entry(img, function):
         branch = words[branch_at]
         if branch & 0xFF00001F != 0x54000009:      # B.LS
             return False
-        displacement = (branch >> 5) & 0x7FFFF
-        if displacement & 0x40000:
-            displacement -= 0x80000
-        destination = (branch_at + 1) * 4 + displacement * 4
-        return (branch_at + 1) * 4 <= destination < len(code)
+        displacement = maybe_sign_extend((branch >> 5) & 0x7FFFF, 19)
+        # B.cond offsets are relative to the branch itself, not the next insn.
+        destination = branch_at * 4 + displacement * 4
+        return branch_at * 4 < destination <= len(code) - 4
     # CMP RSP,[R14+16] or LEA R12,[RSP-frame]; CMP R12,[R14+16].
     if code.startswith(bytes.fromhex("493b6610")):
         branch_at = 4
@@ -889,6 +897,8 @@ def recorded_hash_role(target: Path, sha256: str, backup_dir):
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
             continue
         if data.get("sha256") == sha256:
             return "original"
@@ -968,6 +978,7 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
         "pclntab_offset": hex(pcln_off),
         "go_text_va": hex(go_text_va),
         "status": status,
+        "host_entry": "unverified" if host_ambiguous else "recognised",
         "backup_scope": "Pre-patch bytes; instruction validation is not vendor authenticity verification.",
         "field_offsets": plan["field_offsets"],
         "functions": {k: {fk: (hex(fv) if isinstance(fv, int) else fv) for fk, fv in v.items()} for k, v in funcs.items()},
@@ -1512,7 +1523,8 @@ def preflight(targets, conversation_id=None, db_path=None):
             print(f"      Reason : " + _style(info["error"], "31", c_on))
         else:
             host = info["functions"]["trampolineHost"]["symbol"].rsplit(".", 1)[-1]
-            print(f"      Host   : {host}")
+            note = "  [入口未识别 / entry not recognised]" if info.get("host_entry") == "unverified" else ""
+            print(f"      Host   : {host}{note}")
         if idx < len(binaries):
             print()
 

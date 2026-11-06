@@ -149,31 +149,53 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(chosen['va_start'], 0x1190)
 
     def test_arm64_prologue_layouts_are_recognised(self):
-        # Both prologues start with LDR X16,[X28,#16]; small frames compare SP
-        # directly instead of subtracting the frame first.
-        target = 0x60
-        branch = (lambda at: 0x54000009 | (((target - (at + 4)) >> 2 & 0x7FFFF) << 5))
-        layouts = (([0xF9400B90, 0xD10003F1, 0xEB10023F, branch(12)], 3),
-                   ([0xF9400B90, 0xEB1003FF, branch(8)], 2),
-                   ([0xF9400B90, 0xEB1003FF, branch(8), 0xD503201F], 2))
-        for words, prologue_words in layouts:
-            def image(seq):
-                code = struct.pack(f"<{len(seq)}I", *seq) + b"\x1f\x20\x03\xd5" * 32
-                func = {'symbol': 'x', 'va_start': 0x1000, 'va_end': 0x1000 + len(code),
-                        'file_start': 0, 'file_end': len(code)}
-                return _FakeImage('arm64', code,
-                                  [('__TEXT', 0x1000, len(code), 0, len(code), True)]), func
+        # Real encodings: SP is only addressable in the extended-register form, so
+        # CMP SP, X16 is 0xEB3063FF, not the shifted-form 0xEB1003FF.
+        def branch(at, target):
+            return 0x54000009 | ((((target - at) >> 2) & 0x7FFFF) << 5)
 
-            img, func = image(words)
+        def image(words):
+            code = struct.pack(f"<{len(words)}I", *words) + b"\x1f\x20\x03\xd5" * 32
+            func = {'symbol': 'x', 'va_start': 0x1000, 'va_end': 0x1000 + len(code),
+                    'file_start': 0, 'file_end': len(code)}
+            return _FakeImage('arm64', code, [('__TEXT', 0x1000, len(code), 0, len(code), True)]), func, len(code)
+
+        for words, prologue_words in (([0xF9400B90, 0xD10003F1, 0xEB10023F, branch(12, 0x40)], 3),
+                                      ([0xF9400B90, 0xEB3063FF, branch(8, 0x40)], 2),
+                                      ([0xF9400B90, 0xEB3063FF, branch(8, 0x40), 0xD503201F], 2)):
+            img, func, size = image(words)
             self.assertTrue(f.valid_checkpoint_entry(img, func), [hex(w) for w in words])
             for i in range(prologue_words + 1):
                 tampered = list(words)
                 tampered[i] = 0xD503201F
-                img_bad, func_bad = image(tampered)
+                img_bad, func_bad, _ = image(tampered)
                 self.assertFalse(f.valid_checkpoint_entry(img_bad, func_bad), i)
             # A NOP past the validated prologue is caught by the entry scan.
-            self.assertEqual(f.entry_has_nop_fill('arm64', img.data[:len(words) * 4]),
+            self.assertEqual(f.entry_has_nop_fill('arm64', words and struct.pack(f"<{len(words)}I", *words)),
                              words[-1] == 0xD503201F)
+
+        # B.cond is relative to the branch itself: a self loop is refused, and a
+        # jump to the last instruction is accepted.
+        self.assertFalse(f.valid_checkpoint_entry(*image([0xF9400B90, 0xEB3063FF, branch(8, 8)])[:2]))
+        last = image([0xF9400B90, 0xEB3063FF, branch(8, 8)])[2] - 4
+        self.assertTrue(f.valid_checkpoint_entry(*image([0xF9400B90, 0xEB3063FF, branch(8, last)])[:2]))
+
+    def test_subs_zero_accepts_extended_and_shifted_forms(self):
+        self.assertTrue(f.is_subs_zero(0xEB3063FF))   # SUBS XZR, SP, X16 (extended)
+        self.assertTrue(f.is_subs_zero(0xEB1003FF))   # SUBS XZR, SP, X16 (shifted)
+        self.assertTrue(f.is_subs_zero(0xEB10023F))   # SUBS XZR, X17, X16
+        self.assertFalse(f.is_subs_zero(0xD10003F1))  # SUB X17, SP, #frame
+        self.assertFalse(f.is_subs_zero(0xEB10023E))  # Rd is X30, not XZR
+
+    def test_recorded_hash_role_skips_non_object_manifests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'agy.exe-1-manifest-a.json').write_text('[]')
+            (root / 'agy.exe-2-manifest-b.json').write_text('null')
+            (root / 'agy.exe-3-manifest-c.json').write_text('3')
+            self.assertIsNone(f.recorded_hash_role(root / 'agy.exe', 'deadbeef', root))
+            (root / 'agy.exe-4-manifest-d.json').write_text(json.dumps({'sha256': 'deadbeef'}))
+            self.assertEqual(f.recorded_hash_role(root / 'agy.exe', 'deadbeef', root), 'original')
 
     def test_nop_fill_in_entry_counts_as_rewritten(self):
         self.assertTrue(f.entry_has_nop_fill('arm64', bytes.fromhex('1f2003d5')))
