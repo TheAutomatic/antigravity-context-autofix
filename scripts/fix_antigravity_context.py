@@ -1388,7 +1388,7 @@ def replace_with_retry(source, target, expected_sha256, rollback_bytes=None):
 
 def inspect_context(conversation_id=None, db_path=None):
     """Read historical request metadata; absence or parse failure is never 'locked'."""
-    from verify_session import inspect_session, database_activity, get_conversation_preview, find_conversation_db
+    from verify_session import inspect_session, database_activity, find_conversation_db
     try:
         target_db = db_path.expanduser().resolve() if db_path else find_conversation_db(conversation_id)
         recorded_at = database_activity(target_db)
@@ -1405,9 +1405,6 @@ def inspect_context(conversation_id=None, db_path=None):
             state = "OTHER_WINDOW"
         report["state"] = state
         report["recorded_at"] = recorded_at
-        preview = get_conversation_preview(target_db)
-        if preview:
-            report["preview"] = preview
         report["scope"] = "Latest stored request only; model and current running backend are not verified."
         return report
     except (Exception, SystemExit) as exc:
@@ -1544,46 +1541,9 @@ def preflight(targets, conversation_id=None, db_path=None):
         if idx < len(binaries):
             print()
 
-    print("\n  " + _style("[2] 最近会话上下文快照 / Recent Session Context (DB Snapshot)", "1", c_on))
+    print("\n  " + _style("[2] 近期活跃会话上下文 / Recent Active Sessions (DB Snapshot)", "1", c_on))
     print("  " + _style(sep[:68], "2", c_on))
-    for session in sessions:
-        st = session["state"]
-        label = _short_db_label(session)
-        if st == "EXPECTED_WINDOW":
-            ctx_badge = _style("[✓ 1M 已生效 / 1M ACTIVE (900K/983K)]", "1;32", c_on)
-        elif st == "LIMITED_256K":
-            ctx_badge = _style("[! 256K 默认限制 / LIMITED_256K]", "1;33", c_on)
-        elif st == "MIXED_LIMITS":
-            ctx_badge = _style("[~ 混合水位 / MIXED_LIMITS]", "1;36", c_on)
-        elif st == "OTHER_WINDOW":
-            ctx_badge = _style("[i 其他模型窗口 / OTHER_WINDOW]", "36", c_on)
-        else:
-            ctx_badge = _style("[? 未知 / UNKNOWN]", "2", c_on)
-
-        if "latest_turn" in session:
-            lt = session["latest_turn"]
-            req_lim = lt["gen_max_context_tokens"]
-            exe_lim = lt["executor_max_token_limit"]
-            used = lt.get("gen_used_tokens")
-            ago_str = ""
-            if session.get("recorded_at"):
-                ago_sec = max(0, int(time.time() - session["recorded_at"]))
-                ago_str = f"{ago_sec}s ago" if ago_sec < 60 else (f"{ago_sec // 60}m ago" if ago_sec < 3600 else f"{ago_sec // 3600}h ago")
-            turns = f"turn #{lt['gen_idx']}" + (f", {ago_str}" if ago_str else "")
-            print(f"  *   {label:<32} {ctx_badge}")
-            if used is not None and req_lim:
-                pct = used / req_lim * 100.0
-                filled = min(16, int(round(16 * used / req_lim)))
-                bar_str = "█" * filled + "░" * (16 - filled)
-                bar_color = "32" if pct < 75 else ("33" if pct < 90 else "31")
-                print(f"      Usage  : {_style(bar_str, bar_color, c_on)}  {used:,} / {req_lim:,} tokens ({pct:.1f}%)  ({_style(turns, '2', c_on)})")
-            else:
-                print(f"      Limits : Request={req_lim:,}  |  Executor={exe_lim:,}  ({_style(turns, '2', c_on)})")
-            if session.get("preview"):
-                print(f"      Topic  : {_style(session['preview'], '2', c_on)}")
-        else:
-            print(f"  *   {label:<32} {ctx_badge}  ({_style(session['error'], '2', c_on)})")
-
+    display_sessions = list(sessions)
     if not conversation_id and not db_path:
         from verify_session import conversation_dirs, database_activity
         already_by_path = {s.get("db_path"): s for s in sessions if "db_path" in s}
@@ -1595,26 +1555,60 @@ def preflight(targets, conversation_id=None, db_path=None):
                 cand_dbs = []
             for db_f in cand_dbs:
                 resolved_str = str(db_f.expanduser().resolve())
-                r_ctx = already_by_path.get(resolved_str) or inspect_context(db_path=db_f)
+                r_ctx = already_by_path.get(resolved_str)
+                if r_ctx is None:
+                    r_ctx = inspect_context(db_path=db_f)
+                    r_ctx["source"] = str(d)
                 if "latest_turn" in r_ctx:
                     recent_list.append(r_ctx)
         recent_list.sort(key=lambda x: x.get("recorded_at", 0), reverse=True)
-        if len(recent_list) > 1:
-            print("\n  " + _style("[3] 近期活跃对话上下文排行 / Recent Active Conversations (Top 5)", "1", c_on))
-            print("  " + _style(sep[:68], "2", c_on))
-            for r_s in recent_list[:5]:
-                lt = r_s["latest_turn"]
-                used = lt.get("gen_used_tokens") or 0
-                lim = lt["gen_max_context_tokens"]
-                pct = (used / lim * 100.0) if lim else 0.0
-                filled = min(12, int(round(12 * used / lim))) if lim else 0
-                b_str = "█" * filled + "░" * (12 - filled)
-                b_col = "32" if pct < 75 else ("33" if pct < 90 else "31")
-                ago_s = max(0, int(time.time() - r_s.get("recorded_at", time.time())))
-                ago_t = f"{ago_s}s" if ago_s < 60 else (f"{ago_s // 60}m" if ago_s < 3600 else f"{ago_s // 3600}h")
-                cid_short = Path(r_s["db_path"]).stem[:8]
-                topic = r_s.get("preview") or "-"
-                print(f"  [{ago_t:>4}] {cid_short}  {_style(b_str, b_col, c_on)} {used:>7,}/{lim:<7,} ({pct:4.1f}%) | {topic}")
+        if recent_list:
+            display_sessions = recent_list[:5]
+
+    for s_idx, session in enumerate(display_sessions, 1):
+        st = session["state"]
+        if st == "EXPECTED_WINDOW":
+            ctx_badge = _style("[✓ 1M 已生效 / 1M ACTIVE]", "1;32", c_on)
+        elif st == "LIMITED_256K":
+            ctx_badge = _style("[! 256K 限制 / LIMITED_256K]", "1;33", c_on)
+        elif st == "MIXED_LIMITS":
+            ctx_badge = _style("[~ 混合水位 / MIXED_LIMITS]", "1;36", c_on)
+        elif st == "OTHER_WINDOW":
+            ctx_badge = _style("[i 其他窗口 / OTHER_WINDOW]", "36", c_on)
+        else:
+            ctx_badge = _style("[? 未知 / UNKNOWN]", "2", c_on)
+
+        if "latest_turn" in session:
+            lt = session["latest_turn"]
+            req_lim = lt["gen_max_context_tokens"]
+            exe_lim = lt["executor_max_token_limit"]
+            used = lt.get("gen_used_tokens")
+            ago_str = ""
+            if session.get("recorded_at"):
+                ago_sec = max(0, int(time.time() - session["recorded_at"]))
+                ago_str = f"{ago_sec}s" if ago_sec < 60 else (f"{ago_sec // 60}m" if ago_sec < 3600 else f"{ago_sec // 3600}h")
+            src_name = Path(session.get("source", "")).parent.name
+            surface = "CLI" if "cli" in src_name.lower() else "IDE/App"
+            cid_short = Path(session["db_path"]).stem[:8]
+            proj = session.get("project") or "-"
+            time_tag = f"[{ago_str:>3}]" if ago_str else ""
+            meta_str = f"({surface}, turn #{lt['gen_idx']})"
+            print(f"  #{s_idx}  {time_tag} {_style(cid_short, '1', c_on)}  {_style(f'[{proj}]', '1;36', c_on)}  {_style(meta_str, '2', c_on)}  {ctx_badge}")
+            if used is not None and req_lim:
+                pct = used / req_lim * 100.0
+                filled = min(16, int(round(16 * used / req_lim)))
+                bar_str = "█" * filled + "░" * (16 - filled)
+                bar_color = "32" if pct < 75 else ("33" if pct < 90 else "31")
+                print(f"      Usage : {_style(bar_str, bar_color, c_on)}  {used:,} / {req_lim:,} tokens ({pct:.1f}%)")
+            else:
+                print(f"      Limits: Request={req_lim:,}  |  Executor={exe_lim:,}")
+            if session.get("preview"):
+                print(f"      Topic : {_style(session['preview'], '2', c_on)}")
+            if s_idx < len(display_sessions):
+                print()
+        else:
+            label = _short_db_label(session)
+            print(f"  *   {label:<32} {ctx_badge}  ({_style(session['error'], '2', c_on)})")
 
     print("\n  " + _style("Note: 仅反映历史请求记录；打补丁重启并发送新消息后刷新 / DB reflects past turns only.", "2", c_on))
 

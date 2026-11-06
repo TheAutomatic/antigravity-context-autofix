@@ -127,29 +127,63 @@ def parse_gen_row(g: bytes):
     return chat, gen_limit
 
 
-def get_conversation_preview(db_path: Path) -> str | None:
+def get_project_folder(conn) -> str | None:
+    import urllib.parse
+    try:
+        row = conn.execute("select data from trajectory_metadata_blob where id='main' limit 1").fetchone()
+        if not row or not row[0]:
+            return None
+        ws = get_field(row[0], 1, 2)
+        uri_bytes = get_field(ws, 1, 2)
+        uri = urllib.parse.unquote(uri_bytes.decode("utf-8", errors="replace"))
+        if uri.startswith("file:///"):
+            uri = uri[8:]
+        elif uri.startswith("file://"):
+            uri = uri[7:]
+        return Path(uri.rstrip("/\\")).name or uri
+    except Exception:
+        return None
+
+
+def get_conversation_preview(db_path: Path, conn=None) -> str | None:
     import itertools
     import re
     cid = db_path.stem
     app_dir = db_path.parent.parent
     t_path = app_dir / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
-    if not t_path.is_file():
-        return None
-    try:
-        with t_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in itertools.islice(handle, 30):
-                if len(line) > 262144:
-                    continue
-                obj = json.loads(line)
-                if obj.get("type") == "USER_INPUT" and obj.get("content"):
-                    txt = str(obj["content"])
-                    m = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", txt, re.S)
-                    first_line = (m.group(1) if m else txt).strip().splitlines()
+    if t_path.is_file():
+        try:
+            with t_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in itertools.islice(handle, 30):
+                    if len(line) > 262144:
+                        continue
+                    obj = json.loads(line)
+                    if obj.get("type") == "USER_INPUT" and obj.get("content"):
+                        txt = str(obj["content"])
+                        m = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", txt, re.S)
+                        first_line = (m.group(1) if m else txt).strip().splitlines()
+                        if first_line:
+                            s = first_line[0].strip()
+                            return s[:38] + (".." if len(s) > 38 else "")
+        except Exception:
+            pass
+    if conn is not None:
+        try:
+            row = conn.execute("select step_payload from steps order by idx asc limit 1").fetchone()
+            if row and row[0]:
+                txt = row[0].decode("utf-8", errors="replace")
+                m = re.search(r"sender=([0-9a-f]{8})[0-9a-f-]*\s+priority=\S+\s+content=([^\r\n]+)", txt)
+                if m:
+                    s = f"[Subagent<-{m.group(1)}] {m.group(2).strip()}"
+                    return s[:38] + (".." if len(s) > 38 else "")
+                m2 = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", txt, re.S)
+                if m2:
+                    first_line = m2.group(1).strip().splitlines()
                     if first_line:
                         s = first_line[0].strip()
-                        return s[:36] + (".." if len(s) > 36 else "")
-    except Exception:
-        return None
+                        return s[:38] + (".." if len(s) > 38 else "")
+        except Exception:
+            pass
     return None
 
 
@@ -204,6 +238,8 @@ def inspect_session(conversation_id=None, expected_limit=None, db_path=None):
         e_last_idx, e_last = conn.execute("select idx, data from executor_metadata order by idx desc limit 1").fetchone()
         exec_limit_first = parse_exec_row(e_first)
         exec_limit_last = parse_exec_row(e_last)
+        project_folder = get_project_folder(conn)
+        preview = get_conversation_preview(db_path, conn=conn)
 
     first_turn = {
         "gen_idx": g_first_idx,
@@ -238,6 +274,10 @@ def inspect_session(conversation_id=None, expected_limit=None, db_path=None):
             else (gen_limit_last == expected_limit and exec_limit_last in ACCEPTED_LIMITS)
         ),
     }
+    if project_folder:
+        report["project"] = project_folder
+    if preview:
+        report["preview"] = preview
     return report
 
 
