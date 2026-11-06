@@ -1715,23 +1715,40 @@ def confirm_backup_retention() -> bool:
     return False
 
 
-def prune_old_backups(backup_dir: Path, targets) -> list:
-    """Remove original/manifest pairs that cannot restore any installed build.
+def _resolved(path: Path):
+    """Canonical path, or None when it cannot be resolved (loops, NUL, I/O)."""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
 
-    Only proven-stale records are removed. A pair survives when its original or
-    patched hash matches an installed binary, when its manifest names another
-    installation that still exists, or when the record is incomplete; paths
-    outside the backup directory are never touched.
+
+def _manifest_hash(value) -> str:
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        return value.lower()
+    return ""
+
+
+def prune_old_backups(backup_dir: Path, targets) -> list:
+    """Remove original/manifest pairs belonging to a build that was replaced.
+
+    A pair is deleted only when its manifest names the same file that is
+    installed here, both recorded hashes are complete, and neither matches that
+    file. Another installation, another path, an unresolvable or incomplete
+    record and symlinks are all left untouched, and nothing outside the backup
+    directory is ever removed.
     """
     # Resolve once: macOS maps /var to /private/var, so an unresolved caller path
     # would never be a prefix of the resolved file paths below.
-    base = backup_dir.resolve()
-    if not base.is_dir():
+    base = _resolved(backup_dir)
+    if base is None or not base.is_dir():
         return []
     installed, current = set(), {}
     for target in targets:
+        resolved = _resolved(target)
+        if resolved is None:
+            continue
         try:
-            resolved = target.resolve()
             current.setdefault(resolved.name, set()).add(hashlib.sha256(resolved.read_bytes()).hexdigest())
         except OSError:
             continue
@@ -1749,47 +1766,47 @@ def prune_old_backups(backup_dir: Path, targets) -> list:
         hashes = current.get(manifest.name.split("-", 1)[0])
         if not hashes:
             continue            # no such binary installed here: not ours to judge
-        backup_path = Path(data["backup_path"]) if isinstance(data.get("backup_path"), str) else None
+        backup = data.get("backup_path")
+        backup_path = Path(backup) if isinstance(backup, str) and backup else None
+        original = _manifest_hash(data.get("sha256"))
+        patched = _manifest_hash(data.get("patched_sha256"))
         recorded = data.get("path")
-        if isinstance(recorded, str):
-            try:
-                recorded_path = Path(recorded).resolve()
-            except (OSError, ValueError):
-                recorded_path = None
-            if recorded_path is not None and recorded_path not in installed and recorded_path.exists():
-                # Another installation shares this binary name and was not inspected.
-                keep.add(manifest)
-                if backup_path:
-                    keep.add(backup_path)
-                continue
-        original, patched = data.get("sha256"), data.get("patched_sha256")
-        if not isinstance(original, str) and not isinstance(patched, str):
-            continue            # incomplete record: cannot be proven stale
-        if ((isinstance(patched, str) and patched in hashes)
-                or (isinstance(original, str) and original in hashes)):
+        recorded_path = _resolved(Path(recorded)) if isinstance(recorded, str) and recorded else None
+        if not (original and patched and recorded_path is not None and recorded_path in installed):
+            # Incomplete record, another installation, or one this run did not
+            # inspect: nothing here proves the pair is stale.
+            keep.add(manifest)
+            if backup_path:
+                keep.add(backup_path)
+            continue
+        if patched in hashes or original in hashes:
             keep.add(manifest)
             if backup_path:
                 keep.add(backup_path)
         else:
             stale.append((manifest, backup_path))
-    keep_resolved = {p.resolve() for p in keep}
+    keep_resolved = {r for r in (_resolved(p) for p in keep) if r is not None}
     removed = []
     for manifest, backup_path in stale:
-        for path in (manifest, backup_path):
+        # Backup first: a failed removal must not orphan the backup.
+        for path in (backup_path, manifest):
             if path is None:
                 continue
-            try:
-                resolved = path.resolve()
-                resolved.relative_to(base)
-            except (OSError, ValueError):
+            resolved = _resolved(path)
+            if resolved is None:
                 continue
-            if resolved in keep_resolved or not resolved.exists():
+            try:
+                resolved.relative_to(base)
+            except ValueError:
+                continue
+            if (resolved in keep_resolved or path.is_symlink()
+                    or not resolved.is_file()):
                 continue
             try:
                 size = resolved.stat().st_size
-                resolved.unlink()
+                path.unlink()
             except OSError:
-                continue
+                break
             removed.append((path, size))
     return removed
 

@@ -174,6 +174,9 @@ class RegressionTests(unittest.TestCase):
             packed = struct.pack(f"<{len(words)}I", *words)
             self.assertEqual(f.entry_has_nop_fill('arm64', packed), words[-1] == 0xD503201F)
 
+        # Register 31 is XZR, not SP, in the shifted form, so this is no stack check.
+        self.assertFalse(f.valid_checkpoint_entry(*image([0xF9400B90, 0xEB1003FF, branch(8, 0x40)])[:2]))
+
         # B.cond is relative to the branch itself: a self loop is refused, and a
         # jump to the last instruction is accepted.
         self.assertFalse(f.valid_checkpoint_entry(*image([0xF9400B90, 0xEB3063FF, branch(8, 8)])[:2]))
@@ -182,7 +185,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_subs_zero_accepts_extended_and_shifted_forms(self):
         self.assertTrue(f.is_subs_zero(0xEB3063FF))   # SUBS XZR, SP, X16 (extended)
-        self.assertTrue(f.is_subs_zero(0xEB1003FF))   # SUBS XZR, SP, X16 (shifted)
+        self.assertTrue(f.is_subs_zero(0xEB1003FF))   # SUBS XZR, XZR, X16 (shifted; 31 is XZR)
         self.assertTrue(f.is_subs_zero(0xEB10023F))   # SUBS XZR, X17, X16
         self.assertFalse(f.is_subs_zero(0xD10003F1))  # SUB X17, SP, #frame
         self.assertFalse(f.is_subs_zero(0xEB10023E))  # Rd is X30, not XZR
@@ -198,6 +201,11 @@ class RegressionTests(unittest.TestCase):
                 self.assertFalse(f.confirm_backup_retention())
 
     def test_prune_removes_only_old_version_backups(self):
+        def manifest(name, **fields):
+            path = bdir / f'agy.exe-{name}-manifest-{name}.json'
+            path.write_text(json.dumps(fields))
+            return path
+
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             bdir = root / 'backups'
@@ -205,53 +213,51 @@ class RegressionTests(unittest.TestCase):
             target = root / 'agy.exe'
             target.write_bytes(b'current-patched')
             current = hashlib.sha256(b'current-patched').hexdigest()
-            new_bak = bdir / 'agy.exe-2.0-original-aaaa.bak'
+
+            new_bak = bdir / 'agy.exe-2.0-original-new.bak'
             new_bak.write_bytes(b'orig-new')
-            new_man = bdir / 'agy.exe-2.0-manifest-aaaa.json'
-            new_man.write_text(json.dumps({'path': str(target), 'sha256': 'unused',
-                                           'patched_sha256': current,
-                                           'backup_path': str(new_bak)}))
-            old_bak = bdir / 'agy.exe-1.0-original-bbbb.bak'
+            new_man = manifest('2.0', path=str(target), sha256='a' * 64,
+                               patched_sha256=current, backup_path=str(new_bak))
+            # Same file, complete record, neither hash matches: the only case that
+            # may be removed.
+            old_bak = bdir / 'agy.exe-1.0-original-old.bak'
             old_bak.write_bytes(b'orig-old')
-            old_man = bdir / 'agy.exe-1.0-manifest-bbbb.json'
-            old_man.write_text(json.dumps({'path': str(target), 'sha256': 'x',
-                                           'patched_sha256': 'y',
-                                           'backup_path': str(old_bak)}))
-            # A name with no installed binary, an unreadable root and a backup that
-            # lives outside the directory must all survive.
-            other_man = bdir / 'language_server.exe-9-manifest-cccc.json'
-            other_man.write_text(json.dumps({'sha256': 'q', 'patched_sha256': 'r'}))
-            (bdir / 'agy.exe-0.9-manifest-dddd.json').write_text('[]')
+            old_man = manifest('1.0', path=str(target), sha256='b' * 64,
+                               patched_sha256='c' * 64, backup_path=str(old_bak))
+            # A name with no installed binary, and a non-object root.
+            other_man = manifest('9', sha256='q' * 64, patched_sha256='r' * 64)
+            (bdir / 'agy.exe-0.9-manifest-broken.json').write_text('[]')
+            # A record that names a backup outside the directory: its manifest may
+            # go, the file may not.
             outside = root / 'outside.bak'
             outside.write_bytes(b'keep me')
-            stray_man = bdir / 'agy.exe-0.8-manifest-eeee.json'
-            stray_man.write_text(json.dumps({'sha256': 's', 'patched_sha256': 't',
-                                             'backup_path': str(outside)}))
-            # A second installation with the same binary name, an incomplete record
-            # and a non-string hash must all survive untouched.
+            outside_man = manifest('0.8', path=str(target), sha256='d' * 64,
+                                   patched_sha256='e' * 64, backup_path=str(outside))
+            # A second installation with the same binary name was not inspected.
             other_install = root / 'portable' / 'agy.exe'
             other_install.parent.mkdir()
             other_install.write_bytes(b'another-build')
-            other_man2 = bdir / 'agy.exe-0.7-manifest-ffff.json'
-            other_man2.write_text(json.dumps({'path': str(other_install), 'sha256': 'u',
-                                              'patched_sha256': 'v', 'backup_path': str(other_install)}))
-            incomplete_man = bdir / 'agy.exe-0.6-manifest-gggg.json'
-            incomplete_man.write_text(json.dumps({'backup_path': str(old_bak)}))
-            listy_man = bdir / 'agy.exe-0.5-manifest-hhhh.json'
-            listy_man.write_text(json.dumps({'sha256': ['x'], 'patched_sha256': ['y']}))
+            install_man = manifest('0.7', path=str(other_install), sha256='f' * 64,
+                                   patched_sha256='0' * 64, backup_path=str(other_install))
+            # An incomplete record must survive *and* protect the file it names.
+            shared = bdir / 'shared.bak'
+            shared.write_bytes(b'shared')
+            incomplete_man = manifest('0.6', backup_path=str(shared))
+            listy_man = manifest('0.5', path=str(target), sha256=['x'],
+                                 patched_sha256=['y'], backup_path=str(shared))
 
-            freed_expected = sum(p.stat().st_size for p in (old_man, old_bak, stray_man))
+            freed_expected = sum(p.stat().st_size for p in (old_man, old_bak, outside_man))
             # An aliased path resolves to the same directory; macOS /var ->
             # /private/var does the same, and pruning must still work.
             removed = f.prune_old_backups(bdir / '..' / 'backups', [target])
             self.assertEqual(sorted(p.name for p, _ in removed),
-                             ['agy.exe-0.8-manifest-eeee.json',
-                              'agy.exe-1.0-manifest-bbbb.json',
-                              'agy.exe-1.0-original-bbbb.bak'])
+                             sorted([old_backup.name for old_backup in (old_bak, old_man, outside_man)]))
             self.assertTrue(new_bak.exists() and new_man.exists())
             self.assertTrue(other_man.exists() and outside.exists())
-            self.assertTrue(other_man2.exists() and incomplete_man.exists() and listy_man.exists())
-            self.assertFalse(old_bak.exists() or old_man.exists())
+            self.assertTrue(install_man.exists() and other_install.exists())
+            self.assertTrue(incomplete_man.exists() and listy_man.exists())
+            self.assertTrue(shared.exists(), 'incomplete record must protect its backup')
+            self.assertFalse(old_bak.exists() or old_man.exists() or outside_man.exists())
             self.assertEqual(sum(size for _, size in removed), freed_expected)
 
     def test_recorded_hash_role_skips_non_object_manifests(self):
