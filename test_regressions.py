@@ -187,6 +187,56 @@ class RegressionTests(unittest.TestCase):
         self.assertFalse(f.is_subs_zero(0xD10003F1))  # SUB X17, SP, #frame
         self.assertFalse(f.is_subs_zero(0xEB10023E))  # Rd is X30, not XZR
 
+    def test_retention_prompt_defaults_to_pruning(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            for answer, expected in (('', True), ('1', True), ('2', False), ('x', False)):
+                with patch('builtins.input', return_value=answer):
+                    self.assertEqual(f.confirm_backup_retention(), expected, answer)
+            with patch('builtins.input', side_effect=EOFError):
+                self.assertFalse(f.confirm_backup_retention())
+
+    def test_prune_removes_only_old_version_backups(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            bdir = root / 'backups'
+            bdir.mkdir()
+            target = root / 'agy.exe'
+            target.write_bytes(b'current-patched')
+            current = hashlib.sha256(b'current-patched').hexdigest()
+            new_bak = bdir / 'agy.exe-2.0-original-aaaa.bak'
+            new_bak.write_bytes(b'orig-new')
+            new_man = bdir / 'agy.exe-2.0-manifest-aaaa.json'
+            new_man.write_text(json.dumps({'path': str(target), 'sha256': 'unused',
+                                           'patched_sha256': current,
+                                           'backup_path': str(new_bak)}))
+            old_bak = bdir / 'agy.exe-1.0-original-bbbb.bak'
+            old_bak.write_bytes(b'orig-old')
+            old_man = bdir / 'agy.exe-1.0-manifest-bbbb.json'
+            old_man.write_text(json.dumps({'path': str(target), 'sha256': 'x',
+                                           'patched_sha256': 'y',
+                                           'backup_path': str(old_bak)}))
+            # A name with no installed binary, an unreadable root and a backup that
+            # lives outside the directory must all survive.
+            other_man = bdir / 'language_server.exe-9-manifest-cccc.json'
+            other_man.write_text(json.dumps({'sha256': 'q', 'patched_sha256': 'r'}))
+            (bdir / 'agy.exe-0.9-manifest-dddd.json').write_text('[]')
+            outside = root / 'outside.bak'
+            outside.write_bytes(b'keep me')
+            stray_man = bdir / 'agy.exe-0.8-manifest-eeee.json'
+            stray_man.write_text(json.dumps({'sha256': 's', 'patched_sha256': 't',
+                                             'backup_path': str(outside)}))
+
+            freed_expected = sum(p.stat().st_size for p in (old_man, old_bak, stray_man))
+            removed = f.prune_old_backups(bdir, [target])
+            self.assertEqual(sorted(p.name for p, _ in removed),
+                             ['agy.exe-0.8-manifest-eeee.json',
+                              'agy.exe-1.0-manifest-bbbb.json',
+                              'agy.exe-1.0-original-bbbb.bak'])
+            self.assertTrue(new_bak.exists() and new_man.exists())
+            self.assertTrue(other_man.exists() and outside.exists())
+            self.assertFalse(old_bak.exists() or old_man.exists())
+            self.assertEqual(sum(size for _, size in removed), freed_expected)
+
     def test_recorded_hash_role_skips_non_object_manifests(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

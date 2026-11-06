@@ -1634,6 +1634,80 @@ def confirm_actions(targets, backup_dir, restore=False):
         raise SystemExit("Cancelled. No files modified.")
 
 
+def confirm_backup_retention() -> bool:
+    """True to prune backups of builds that are no longer installed (default)."""
+    print("\n老版本备份 / Old-version backups:")
+    print("  1) 保留当前版本的原版与清单，打完补丁后清理老版本备份（默认）")
+    print("     Keep this build's original, prune backups of older builds afterwards (default)")
+    print("  2) 保留全部已有备份 / Keep every existing backup")
+    try:
+        answer = input("选择 / Choose [1/2] (Enter = 1): ").strip()
+    except EOFError:
+        print("No input: keeping all backups.")
+        return False
+    if answer in ("", "1"):
+        return True
+    if answer == "2":
+        return False
+    print(f"Unrecognised {answer!r}: keeping all backups.")
+    return False
+
+
+def prune_old_backups(backup_dir: Path, targets) -> list:
+    """Remove original/manifest pairs that cannot restore any current target.
+
+    A manifest survives when its original or patched hash matches a binary that
+    is still installed. Unreadable manifests, names without a current target and
+    paths outside the backup directory are left untouched.
+    """
+    if not backup_dir.is_dir():
+        return []
+    current = {}
+    for target in targets:
+        try:
+            current.setdefault(target.name, set()).add(hashlib.sha256(target.read_bytes()).hexdigest())
+        except OSError:
+            continue
+    entries = []
+    for manifest in sorted(backup_dir.glob("*manifest*.json")):
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            entries.append((manifest, data))
+    keep, stale = set(), []
+    for manifest, data in entries:
+        hashes = current.get(manifest.name.split("-", 1)[0])
+        if not hashes:
+            continue
+        if data.get("patched_sha256") in hashes or data.get("sha256") in hashes:
+            keep.add(manifest)
+            if data.get("backup_path"):
+                keep.add(Path(data["backup_path"]))
+        else:
+            stale.append((manifest, data))
+    removed = []
+    for manifest, data in stale:
+        candidates = [manifest]
+        if data.get("backup_path"):
+            candidates.append(Path(data["backup_path"]))
+        for path in candidates:
+            try:
+                path.resolve().relative_to(backup_dir)
+            except (OSError, ValueError):
+                continue
+            if path in keep or not path.exists():
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError:
+                continue
+            removed.append((path, size))
+    return removed
+
+
 def validate_report_path(path, targets, backup_dir):
     if path is None:
         return
@@ -1696,6 +1770,7 @@ def main():
         for target in actions:
             print(f"Restore backup: {find_restore_backup(target, args.backup_dir)}")
     confirm_actions(actions, args.backup_dir, args.restore)
+    prune_old = confirm_backup_retention() if not args.restore else False
 
     if args.kill and not args.dry_run:
         print("Stopping running backend processes (agy / language_server)...")
@@ -1713,6 +1788,18 @@ def main():
         else:
             res = patch_target(t, args.backup_dir, dry_run=args.dry_run)
             results.append(res)
+
+    if prune_old:
+        removed = prune_old_backups(args.backup_dir, targets)
+        for path, _ in removed:
+            print(f"  [prune] {path.name}")
+        if removed:
+            freed = sum(size for _, size in removed)
+            amount = f"{freed / (1024 * 1024):.0f} MiB" if freed >= 1024 * 1024 else f"{freed / 1024:.0f} KiB"
+            print(f"  [prune] 已清理 {len(removed)} 个老版本备份文件，释放 {amount}"
+                  f" / removed {len(removed)} old-version files, {amount} freed")
+        else:
+            print("  [prune] 没有需要清理的老版本备份 / no old-version backups to prune")
 
     if args.json_out and results:
         write_report(args.json_out, results)

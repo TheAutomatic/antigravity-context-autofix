@@ -49,9 +49,10 @@ Windows wrappers: check-status.cmd, fix-all.cmd, restore-all.cmd, verify-latest.
 3. Report the most recently modified database separately for IDE and CLI. No model launch or request is sent.
 4. In patch mode, stop before changes if any selected backend is incompatible or partially patched. Use repeated `--target PATH` options to select a supported subset. Restore independently verifies current-file and backup hashes without requiring patch-parser compatibility.
 5. List actual action paths and backup directory. Only explicit Y at `Continue? [y/N]` proceeds. Enter, other input and EOF cancel. If all files are patched already, exit without changes.
-6. List running backend process names and PIDs. Close the IDE / CLI and type Y to check again; cancel otherwise. Processes are not terminated by default.
-7. Back up and verify original SHA256, patch a temporary file, sign / verify on macOS, and record the final hash. Recheck processes and current file hash before atomic replacement.
-8. Update the version sidecar and recheck patch state. Each backend is independent: failure midway through multiple targets does not roll back completed targets, which retain their backups.
+6. Patch mode then asks how to treat old backups: `1` (default, just press Enter) prunes backups that do not belong to the installed build after a successful patch, keeping only this build's original and manifest; `2` keeps every existing backup. No input or an unrecognised answer keeps them; restore never prunes.
+7. List running backend process names and PIDs. Close the IDE / CLI and type Y to check again; cancel otherwise. Processes are not terminated by default.
+8. Back up and verify original SHA256, patch a temporary file, sign / verify on macOS, and record the final hash. Recheck processes and current file hash before atomic replacement.
+9. Update the version sidecar and recheck patch state. Old-version backups are pruned only when every action succeeded and step 6 chose `1`, and only for files with the same binary name whose hashes match neither the current file; debug paths and files outside the backup directory are never touched. Each backend is independent: failure midway through multiple targets does not roll back completed targets, which retain their backups.
 
 `--status`, `--check` and `--dry-run` are equivalent read-only modes: no prompt, termination or backend writes. `--json-out` writes the requested report; database access may use a temporary read-only snapshot.
 
