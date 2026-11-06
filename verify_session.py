@@ -3,8 +3,11 @@
 Read-only verifier for Antigravity IDE / Desktop / CLI SQLite conversation databases.
 Checks:
 - Both ~/.gemini/antigravity/conversations/<cid>.db and ~/.gemini/antigravity-cli/conversations/<cid>.db
-- Latest turn (and idx=0) executor_metadata checkpoint max_token_limit (expected 983040)
-- Latest turn (and idx=0) gen_metadata ChatStartMetadata.ContextWindowMetadata.max_context_tokens (expected 983040)
+- Latest turn (and idx=0) gen_metadata ChatStartMetadata.ContextWindowMetadata.max_context_tokens:
+  the checkpoint budget this patch sets, 900000 (983040 on older patches)
+- Latest turn (and idx=0) executor_metadata Config.max_token_limit: same budget after clamping;
+  rows recorded before a restart still carry 983040
+Both sides must be one of ACCEPTED_LIMITS; 256000 stays LIMITED_256K.
 """
 
 from __future__ import annotations
@@ -16,6 +19,9 @@ import tempfile
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
+
+# Checkpoint budget written by the patch, or the pre-900K patched ceiling.
+ACCEPTED_LIMITS = (900000, 983040)
 
 
 def read_varint(b: bytes, p: int):
@@ -148,7 +154,7 @@ def open_session_db(db_path):
         conn.close()
 
 
-def inspect_session(conversation_id=None, expected_limit=983040, db_path=None):
+def inspect_session(conversation_id=None, expected_limit=None, db_path=None):
     db_path = db_path.expanduser().resolve() if db_path else find_conversation_db(conversation_id)
     with open_session_db(db_path) as (conn, read_mode):
         conn.execute("BEGIN")
@@ -181,8 +187,12 @@ def inspect_session(conversation_id=None, expected_limit=983040, db_path=None):
             "executor_idx": e_last_idx,
             "executor_max_token_limit": exec_limit_last,
         },
-        "expected_limit": expected_limit,
-        "latest_limit_ok": (gen_limit_last == expected_limit and exec_limit_last == expected_limit),
+        "expected_limit": 900000 if expected_limit is None else expected_limit,
+        "latest_limit_ok": (
+            gen_limit_last in ACCEPTED_LIMITS and exec_limit_last in ACCEPTED_LIMITS
+            if expected_limit is None
+            else (gen_limit_last == expected_limit and exec_limit_last in ACCEPTED_LIMITS)
+        ),
     }
     return report
 
@@ -191,7 +201,7 @@ def main():
     ap = argparse.ArgumentParser(description="Read actual request context window from the session DB.")
     ap.add_argument("conversation_id", nargs="?", help="Conversation UUID (omit to inspect the newest .db automatically)")
     ap.add_argument("--db", type=Path, help="Read an explicit conversation database")
-    ap.add_argument("--expected-limit", type=int, default=983040, help="Expected max_context_tokens (default: 983040)")
+    ap.add_argument("--expected-limit", type=int, default=None, help="Expected max_context_tokens (default: 900000 or 983040)")
     args = ap.parse_args()
     if args.db and args.conversation_id:
         ap.error("Choose --db or conversation_id, not both")

@@ -119,8 +119,10 @@ class StatusTests(unittest.TestCase):
             for table in ('gen_metadata', 'executor_metadata'):
                 conn.execute(f'create table {table} (idx integer, data blob)')
             for gen, executor, state in ((256000, 256000, 'LIMITED_256K'),
+                                         (900000, 900000, 'EXPECTED_WINDOW'),
+                                         (900000, 983040, 'EXPECTED_WINDOW'),
                                          (983040, 983040, 'EXPECTED_WINDOW'),
-                                         (983040, 256000, 'MIXED_LIMITS'),
+                                         (900000, 256000, 'MIXED_LIMITS'),
                                          (128000, 128000, 'OTHER_WINDOW')):
                 for table in ('gen_metadata', 'executor_metadata'):
                     conn.execute(f'delete from {table}')

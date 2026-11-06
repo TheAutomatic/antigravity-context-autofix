@@ -221,7 +221,12 @@ class RegressionTests(unittest.TestCase):
                 target.write_bytes(data)
                 self.assertEqual(f.analyze_binary(target)['status'], 'UNKNOWN_OR_PARTIAL')
             self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), plan['sha256'])
-            entry = next(c for c in plan['changes'] if c['name'] == 'checkpointNeeded_entry')
+            chk_off = int(plan['functions']['checkpointNeeded']['file_start'], 16)
+            data = bytearray(original)
+            data[chk_off:chk_off + 4] = b'\xc3\x90\x90\x90'
+            target.write_bytes(data)
+            self.assertEqual(f.analyze_binary(target, backup_dir=False)['status'], 'UNKNOWN_OR_PARTIAL')
+            entry = next(c for c in plan['changes'] if c['name'] == 'trampolineHost_entry')
             if plan['arch'] == 'arm64':
                 # A changed return-register sequence must not be accepted.
                 data = bytearray(original)

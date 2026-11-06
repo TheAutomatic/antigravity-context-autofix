@@ -7,9 +7,9 @@ Automatic Go pclntab locator and context/rules patcher for Antigravity:
 - Zero third-party dependencies (Python 3 standard library only)
 
 What it patches (dynamically located via Go 1.20+ pclntab & getter instruction decoding):
-1. applyFeatureProviderCheckpointOverrideConfig -> jumps to trampoline in hooks.checkpointNeeded+0x20
-2. hooks.checkpointNeeded -> returns (false, nil) at entry; hosts Argon 1M trampoline at +0x20
-   Sets max_token_limit = 1000000 (actual request window 983040) for Argon High/Medium/Low (1417/1418/1419)
+1. applyFeatureProviderCheckpointOverrideConfig -> jumps to trampoline in (*CheckpointConfig).SetSessionSummaryPromptOverride+0x20
+2. (*CheckpointConfig).SetSessionSummaryPromptOverride -> returns at entry; hosts Argon trampoline at +0x20
+   Sets max_token_limit = 900000 for Argon High/Medium/Low (1417/1418/1419) while keeping hooks.checkpointNeeded intact for native auto-compaction
 3. readGlobalRules / parseRuleFile / convertSkillPath -> per-file byte limit 24000 -> 1048576 (1 MiB)
 4. computeTruncatedCustomizations -> rules & customizations token budgets 20000 -> 131072 tokens
 """
@@ -19,6 +19,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -30,6 +31,7 @@ TARGET_FUNCS = {
     "GetPlannerConfig": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CascadeConfig).GetPlannerConfig",
     "GetPlanModel": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CascadePlannerConfig).GetPlanModel",
     "GetMaxTokenLimit": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CheckpointConfig).GetMaxTokenLimit",
+    "trampolineHost": "google3/third_party/jetski/cortex_pb/cortex_go_proto.(*CheckpointConfig).SetSessionSummaryPromptOverride",
     "applyOverride": "google3/third_party/jetski/cortex/config/config.applyFeatureProviderCheckpointOverrideConfig",
     "checkpointNeeded": "google3/third_party/oneharness/internal/core/hooks/hooks.checkpointNeeded",
     "readGlobalRules": "google3/third_party/jetski/cortex/customizations/customizations.(*Manager).readGlobalRules",
@@ -37,6 +39,8 @@ TARGET_FUNCS = {
     "convertSkillPath": "google3/third_party/jetski/cortex/customizations/customizations.convertSkillPath",
     "computeTruncated": "google3/third_party/jetski/cortex/customizations/customizations.(*Manager).computeTruncatedCustomizations",
 }
+
+ARGON_MAX_TOKEN_LIMIT = 900000
 
 
 class BinaryImage:
@@ -208,7 +212,7 @@ def locate_go_functions(img: BinaryImage):
                     "file_end": foff_e,
                 }
             return idx, go_text_va, funcs
-    raise RuntimeError("Could not locate the 9 required Go functions in pclntab")
+    raise RuntimeError(f"Could not locate the {len(TARGET_FUNCS)} required Go functions in pclntab")
 
 
 def build_x86_64_plan(img: BinaryImage, funcs: dict):
@@ -241,9 +245,9 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     if tail_idx < 9 or b_apply.find(b"\x31\xc9\xc9\xc3", tail_idx + 1) != -1:
         raise RuntimeError("Could not uniquely locate epilogue (31 c9 c9 c3) in applyFeatureProviderCheckpointOverrideConfig")
 
-    f_chk = funcs["checkpointNeeded"]
+    f_chk = funcs["trampolineHost"]
     if f_chk["file_end"] - f_chk["file_start"] < 128:
-        raise RuntimeError("hooks.checkpointNeeded is too small to host trampoline")
+        raise RuntimeError("(*CheckpointConfig).SetSessionSummaryPromptOverride is too small to host trampoline")
     chk_va = f_chk["va_start"]
     chk_foff = f_chk["file_start"]
     tramp_va = chk_va + 0x20
@@ -299,8 +303,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             + b"\x81\xea\x89\x05\x00\x00"                    # sub edx, 1417
             + b"\x83\xfa\x02"                                # cmp edx, 2
             + b"\x77\x07"                                    # ja .done (+7 -> 35)
-            + bytes([0xC7, 0x41, max_limit_off])             # mov dword ptr [rcx + max_limit_off], 1000000
-            + struct.pack("<I", 1000000)
+            + bytes([0xC7, 0x41, max_limit_off])             # mov dword ptr [rcx + max_limit_off], 900000
+            + struct.pack("<I", ARGON_MAX_TOKEN_LIMIT)
             + bytes([0x48, 0x89, 0x48, checkpoint_off])      # .done: mov [rax + checkpoint_off], rcx
             + b"\x31\xdb"                                    # xor ebx, ebx
             + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6)
@@ -318,8 +322,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             + b"\x81\xe9\x89\x05\x00\x00"                    # sub ecx, 1417
             + b"\x83\xf9\x02"                                # cmp ecx, 2
             + b"\x77\x07"                                    # ja .done (+7 -> 35)
-            + bytes([0xC7, 0x40, max_limit_off])             # mov dword ptr [rax + max_limit_off], 1000000
-            + struct.pack("<I", 1000000)
+            + bytes([0xC7, 0x40, max_limit_off])             # mov dword ptr [rax + max_limit_off], 900000
+            + struct.pack("<I", ARGON_MAX_TOKEN_LIMIT)
             + bytes([0x48, 0x89, 0x42, checkpoint_off])      # .done: mov [rdx + checkpoint_off], rax
             + b"\x31\xdb"                                    # xor ebx, ebx
             + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6 -> mov rax, rdx)
@@ -405,7 +409,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     changes = [
         {
             "name": "applyOverride_exit",
-            "purpose": "applyFeatureProviderCheckpointOverrideConfig: jump to Argon 1M trampoline",
+            "purpose": "applyFeatureProviderCheckpointOverrideConfig: jump to Argon 900K trampoline",
             "va": hex(exit_va),
             "offset": hex(exit_foff),
             "before": exit_before.hex(),
@@ -413,8 +417,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             "fixed_before": True,
         },
         {
-            "name": "checkpointNeeded_entry",
-            "purpose": "hooks.checkpointNeeded: return (false, nil)",
+            "name": "trampolineHost_entry",
+            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride: no-op return at entry",
             "va": hex(chk_va),
             "offset": hex(chk_foff),
             "before": data[chk_foff : chk_foff + len(chk_entry_after)].hex(),
@@ -422,8 +426,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             "fixed_before": False,
         },
         {
-            "name": "checkpointNeeded_trampoline",
-            "purpose": "hooks.checkpointNeeded+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=1000000 trampoline",
+            "name": "trampolineHost_trampoline",
+            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -487,9 +491,9 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
 
     b_apply = fbytes("applyOverride")
     f_apply = funcs["applyOverride"]
-    f_chk = funcs["checkpointNeeded"]
+    f_chk = funcs["trampolineHost"]
     if f_chk["file_end"] - f_chk["file_start"] < 128:
-        raise RuntimeError("hooks.checkpointNeeded is too small to host trampoline")
+        raise RuntimeError("(*CheckpointConfig).SetSessionSummaryPromptOverride is too small to host trampoline")
     chk_va = f_chk["va_start"]
     chk_foff = f_chk["file_start"]
     tramp_va = chk_va + 0x20
@@ -533,8 +537,8 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
         0x51162400 | (scratch << 5) | scratch,                 # sub model, model, #1417
         0x7100081F | (scratch << 5),                           # cmp model, #2
         0x54000088,                                           # b.hi .done
-        0x52884800 | scratch,                                 # mov scratch, #0x4240
-        0x72A001E0 | scratch,                                 # movk scratch, #0xf, lsl #16
+        0x52800000 | ((ARGON_MAX_TOKEN_LIMIT & 0xFFFF) << 5) | scratch,          # movz scratch, #0xbba0
+        0x72A00000 | (((ARGON_MAX_TOKEN_LIMIT >> 16) & 0xFFFF) << 5) | scratch,  # movk scratch, #0xd, lsl #16
         0xB9000000 | ((max_limit_off // 4) << 10) | (checkpoint << 5) | scratch,
         checkpoint_store,                                    # original store
         0x14000000 | ((((exit_va + 4) - (tramp_va + 44)) >> 2) & 0x03FFFFFF),
@@ -572,7 +576,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
     changes = [
         {
             "name": "applyOverride_exit",
-            "purpose": "applyFeatureProviderCheckpointOverrideConfig: branch to Argon 1M trampoline",
+            "purpose": "applyFeatureProviderCheckpointOverrideConfig: branch to Argon 900K trampoline",
             "va": hex(exit_va),
             "offset": hex(exit_foff),
             "before": exit_before.hex(),
@@ -580,8 +584,8 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
             "fixed_before": True,
         },
         {
-            "name": "checkpointNeeded_entry",
-            "purpose": "hooks.checkpointNeeded: return (false, nil)",
+            "name": "trampolineHost_entry",
+            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride: no-op return at entry",
             "va": hex(chk_va),
             "offset": hex(chk_foff),
             "before": data[chk_foff : chk_foff + len(chk_entry_after)].hex(),
@@ -589,8 +593,8 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
             "fixed_before": False,
         },
         {
-            "name": "checkpointNeeded_trampoline",
-            "purpose": "hooks.checkpointNeeded+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=1000000 trampoline",
+            "name": "trampolineHost_trampoline",
+            "purpose": "(*CheckpointConfig).SetSessionSummaryPromptOverride+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -664,12 +668,38 @@ def valid_checkpoint_entry(img, function):
     return False
 
 
-def analyze_binary(target: Path):
+def _try_upgrade_from_verified_backup(target: Path, sha256: str, backup_dir: Path | bool | None):
+    if backup_dir is False:
+        return None
+    bdir = backup_dir if isinstance(backup_dir, Path) else (Path.home() / ".gemini" / "agy-patches")
+    if not bdir.is_dir():
+        return None
+    try:
+        _, mdata, bak = select_restore_backup(target, bdir, sha256)
+        if sha256 == mdata.get("patched_sha256") and bak.resolve() != target.resolve():
+            bak_info = analyze_binary(bak, backup_dir=False)
+            if bak_info["status"] == "UNPATCHED":
+                bak_info["path"] = str(target)
+                bak_info["target_disk_sha256"] = sha256
+                bak_info["upgrade_from_backup"] = str(bak)
+                return bak_info
+    except Exception:
+        pass
+    return None
+
+
+def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
     data = target.read_bytes()
     sha256 = hashlib.sha256(data).hexdigest()
     img = BinaryImage(data)
     pcln_off, go_text_va, funcs = locate_go_functions(img)
-    plan = build_x86_64_plan(img, funcs) if img.arch == "x86_64" else build_arm64_plan(img, funcs)
+    try:
+        plan = build_x86_64_plan(img, funcs) if img.arch == "x86_64" else build_arm64_plan(img, funcs)
+    except RuntimeError:
+        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir)
+        if upgraded is not None:
+            return upgraded
+        raise
 
     all_after = True
     all_fixed_before = True
@@ -683,13 +713,14 @@ def analyze_binary(target: Path):
         if c["fixed_before"] and cur != bef:
             all_fixed_before = False
 
-    if all_after:
+    checkpoint_needed_intact = valid_checkpoint_entry(img, funcs["checkpointNeeded"])
+    if all_after and checkpoint_needed_intact:
         status = "ALREADY_PATCHED"
-    elif all_fixed_before:
-        # Variable original bytes must not hide an interrupted checkpoint patch.
-        entry = next(c for c in plan["changes"] if c["name"] == "checkpointNeeded_entry")
-        trampoline = next(c for c in plan["changes"] if c["name"] == "checkpointNeeded_trampoline")
-        original_entry = valid_checkpoint_entry(img, funcs["checkpointNeeded"])
+    elif all_fixed_before and checkpoint_needed_intact:
+        # Variable original bytes must not hide an interrupted trampoline patch.
+        entry = next(c for c in plan["changes"] if c["name"] == "trampolineHost_entry")
+        trampoline = next(c for c in plan["changes"] if c["name"] == "trampolineHost_trampoline")
+        original_entry = valid_checkpoint_entry(img, funcs["trampolineHost"])
         partial = False
         for change in (entry, trampoline):
             current, patched = bytes.fromhex(change["before"]), bytes.fromhex(change["after"])
@@ -704,6 +735,10 @@ def analyze_binary(target: Path):
     else:
         status = "UNKNOWN_OR_PARTIAL"
 
+    if status == "UNKNOWN_OR_PARTIAL":
+        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir)
+        if upgraded is not None:
+            return upgraded
     return {
         "path": str(target),
         "format": img.fmt,
@@ -803,7 +838,7 @@ def discover_default_targets() -> list[Path]:
 
 
 def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
-    info = analyze_binary(target)
+    info = analyze_binary(target, backup_dir=backup_dir)
     print(f"\nTarget : {info['path']}")
     print(f"Format : {info['format']} {info['arch']} ({info['size']} bytes)")
     print(f"SHA256 : {info['sha256']}")
@@ -830,9 +865,12 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
     ver = get_binary_version(target)
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_file = backup_dir / f"{target.name}-{ver}-original-{info['sha256'][:16]}.bak"
-    raw_bytes = target.read_bytes()
-    if hashlib.sha256(raw_bytes).hexdigest() != info["sha256"]:
+    target_disk_sha256 = info.get("target_disk_sha256", info["sha256"])
+    if hashlib.sha256(target.read_bytes()).hexdigest() != target_disk_sha256:
         raise RuntimeError("Backend changed during analysis; rerun before patching")
+    raw_bytes = Path(info["upgrade_from_backup"]).read_bytes() if info.get("upgrade_from_backup") else target.read_bytes()
+    if hashlib.sha256(raw_bytes).hexdigest() != info["sha256"]:
+        raise RuntimeError("Original source bytes failed SHA256 verification")
     if backup_file.exists():
         bak_sha = hashlib.sha256(backup_file.read_bytes()).hexdigest()
         if bak_sha != info["sha256"]:
@@ -890,8 +928,8 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
         patched_sha256 = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
         info["patched_sha256"] = patched_sha256
         info["patched_size"] = tmp_path.stat().st_size
+        replace_with_retry(tmp_path, target, target_disk_sha256)
         write_manifest(manifest_file, info)
-        replace_with_retry(tmp_path, target, info["sha256"])
     except PermissionError as e:
         raise RuntimeError(
             f"PermissionError replacing {target} (file is locked by a running Antigravity/agy process).\n"
@@ -1018,7 +1056,18 @@ def replace_with_retry(source, target, expected_sha256):
         if hashlib.sha256(target.read_bytes()).hexdigest() != expected_sha256:
             raise RuntimeError(f"Backend changed before replacement: {target}; rerun the check")
         try:
-            os.replace(source, target)
+            try:
+                os.replace(source, target)
+            except OSError as e:
+                if os.name == "nt" and getattr(e, "winerror", None) == 6:
+                    data = Path(source).read_bytes()
+                    with open(target, "wb") as dst_f:
+                        dst_f.write(data)
+                        dst_f.flush()
+                        os.fsync(dst_f.fileno())
+                    Path(source).unlink()
+                else:
+                    raise
             return
         except PermissionError:
             print(f"无法替换 {target}：文件被占用或目录不可写。")
@@ -1039,7 +1088,7 @@ def inspect_context(conversation_id=None, db_path=None):
         report = inspect_session(conversation_id=conversation_id, db_path=db_path)
         latest = report["latest_turn"]
         limits = (latest["gen_max_context_tokens"], latest["executor_max_token_limit"])
-        if limits == (983040, 983040):
+        if limits[0] in (900000, 983040) and limits[1] in (900000, 983040):
             state = "EXPECTED_WINDOW"
         elif limits == (256000, 256000):
             state = "LIMITED_256K"
@@ -1188,7 +1237,7 @@ def preflight(targets, conversation_id=None, db_path=None):
         st = session["state"]
         label = _short_db_label(session)
         if st == "EXPECTED_WINDOW":
-            ctx_badge = _style("[✓ 1M 已生效 / 1M ACTIVE (983K)]", "1;32", c_on)
+            ctx_badge = _style("[✓ 1M 已生效 / 1M ACTIVE (900K/983K)]", "1;32", c_on)
         elif st == "LIMITED_256K":
             ctx_badge = _style("[! 256K 默认限制 / LIMITED_256K]", "1;33", c_on)
         elif st == "MIXED_LIMITS":

@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-修复 Antigravity 本地后端的 Argon High / Medium / Low 上下文窗口限制，目标实际请求窗口为 **983040 tokens**，并调整自动 checkpoint 和规则读取预算。同一份 Python 脚本提供自动发现、适配检查、上下文查询、确认后备份修改，以及原版恢复。仅需 **Python 3.9+ 标准库**，不分发专有二进制。
+修复 Antigravity 本地后端的 Argon High / Medium / Low 上下文窗口限制，将请求与自动压缩水位设为 **900000 tokens**（预留安全余量，避免本地字符估算偏低导致冲破云端 1048576 硬上限报 HTTP 400），**完整保留 `hooks.checkpointNeeded` 原生自动摘要压缩（`<CONTEXT_SUMMARY>`）功能**，并调整规则读取预算。同一份 Python 脚本提供自动发现、适配检查、上下文查询、确认后备份修改，以及原版恢复。仅需 **Python 3.9+ 标准库**，不分发专有二进制。
 
 ## 预期适用范围
 
@@ -98,7 +98,7 @@ python3 fix_antigravity_context.py --target /路径一/agy --target /路径二/l
 | UNSUPPORTED_OR_UNRECOGNIZED | 当前脚本无法匹配文件格式、符号或指令 |
 | UNKNOWN_OR_PARTIAL | 不能认定为完整原版或完整补丁，拒绝打补丁；恢复仍可按哈希核验 |
 | LIMITED_256K | 历史请求的 gen / executor 均为 256000 |
-| EXPECTED_WINDOW | 两处均为 983040 |
+| EXPECTED_WINDOW | gen / executor 均为 900000 或 983040（旧版补丁、重启前的历史记录可能仍是 983040） |
 | MIXED_LIMITS / OTHER_WINDOW | 两处不一致或其他窗口，结合模型排查 |
 | UNKNOWN | 数据不足，不能推断锁在256K或已解锁 |
 
@@ -117,10 +117,10 @@ python3 verify_session.py --db /实际路径/session.db
 
 ## 修改内容与 Mac 签名
 
-- Argon High / Medium / Low（当前编号1417/1418/1419）最终配置出口写入 `max_token_limit=1000000`；当前实测实际请求窗口 **983040**。
-- 自动 checkpoint 判断返回 `(false, nil)`，借不可达函数体放跳板。这不等于关闭所有裁剪，手动 compact 未验证。
+- Argon High / Medium / Low（当前编号1417/1418/1419）最终配置出口写入 `max_token_limit=900000`（请求与自动压缩窗口 **900000**，为本地估算与云端分词器误差预留余量，防止超过服务端 1048576 上限报 400）。
+- **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为借用全二进制零外部调用的空闲方法 `(*CheckpointConfig).SetSessionSummaryPromptOverride` 放置 46/48 字节跳板，使对话接近 900K 时自动触发原生 `<CONTEXT_SUMMARY>` 压缩。
 - 规则 / skill 单文件读取上限从24000字节提高到 **1 MiB**。
-- Rules / Customizations 总预算从20000各提高到 **131072 tokens**。规则和 checkpoint 的修改不限于三档窗口选择条件。
+- Rules / Customizations 总预算从20000各提高到 **131072 tokens**。规则预算的修改不限于三档窗口选择条件。
 
 代码补丁保持长度；Mac 签名可能改变最终大小。使用系统 `codesign --force --sign -` 做本地 ad-hoc 签名，无需证书；签名和补丁校验通过才替换。不保留原厂开发者身份/公证信任，不关闭 Gatekeeper 或 SIP。
 

@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-Patch the local Antigravity backend to raise the Argon High / Medium / Low request context window to an expected **983040 tokens**, and adjust automatic checkpoint behavior and rule budgets. One Python script provides discovery, compatibility checks, recorded-context inspection, backup and patching after confirmation, and original-byte restoration. **Python 3.9+ standard library only.** No proprietary binaries are distributed.
+Patch the local Antigravity backend to raise the Argon High / Medium / Low request context window and auto-compaction threshold to **900000 tokens** (leaving headroom for local-vs-server tokenizer variance below the 1048576 server hard limit), **preserve native `hooks.checkpointNeeded` automatic `<CONTEXT_SUMMARY>` compaction**, and raise rule budgets. One Python script provides discovery, compatibility checks, recorded-context inspection, backup and patching after confirmation, and original-byte restoration. **Python 3.9+ standard library only.** No proprietary binaries are distributed.
 
 ## Expected compatibility
 
@@ -90,7 +90,7 @@ These databases are not mapped to a particular discovered executable. They may b
 | UNSUPPORTED_OR_UNRECOGNIZED | Format, symbols or instructions cannot be matched |
 | UNKNOWN_OR_PARTIAL | Neither recognized original nor complete patch; refuse patching, but hash-verified restoration remains available |
 | LIMITED_256K | Both recorded request and executor limits are 256000 |
-| EXPECTED_WINDOW | Both are 983040 |
+| EXPECTED_WINDOW | Both are 900000 or 983040 (older patches and turns recorded before a restart may still read 983040) |
 | MIXED_LIMITS / OTHER_WINDOW | Differing limits or another window; inspect model choice |
 | UNKNOWN | Insufficient evidence |
 
@@ -107,10 +107,10 @@ Acceptance reports `latest_limit_ok: true` when both limits match. A stored wind
 
 ## Changes and signing
 
-- At final config merge, set max_token_limit=1000000 for Argon High / Medium / Low (IDs 1417–1419); observed request window is **983040**.
-- Return (false, nil) from automatic checkpoint predicate and reuse unreachable code for a trampoline. This does not disable every truncation path; manual compact is untested.
+- At final config merge, set `max_token_limit=900000` for Argon High / Medium / Low (IDs 1417–1419) so both the request window and native auto-compaction trigger sit safely below the 1,048,576 server hard limit.
+- **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction triggers at 900K tokens; host the 46/48-byte trampoline inside the unreferenced protobuf setter `(*CheckpointConfig).SetSessionSummaryPromptOverride`.
 - Raise per-file rule / skill cap from 24000 bytes to **1 MiB**.
-- Raise rules and customizations budgets from 20000 to **131072 tokens** each. Rule / checkpoint changes are not gated by the three-model window condition.
+- Raise rules and customizations budgets from 20000 to **131072 tokens** each. Rule budget changes are not gated by the three-model window condition.
 
 Code edits preserve length; macOS signing may change final size. System codesign performs ad-hoc signing with `--force --sign -` on a temporary file, without a developer certificate. Signing and patch checks must pass before replacement. Vendor identity / notarization trust is not retained. Gatekeeper and SIP are not disabled.
 
