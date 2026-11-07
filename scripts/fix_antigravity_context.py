@@ -166,70 +166,131 @@ class BinaryImage:
         raise ValueError(f"Virtual address {hex(va)} is not mapped to file bytes")
 
 
+def _bsearch_ftab(data: bytes, ftab_base: int, nfunc: int, target_func_off: int) -> int:
+    lo, hi = 0, nfunc - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        foff = struct.unpack_from("<I", data, ftab_base + mid * 8 + 4)[0]
+        if foff == target_func_off:
+            return mid
+        if foff < target_func_off:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+
+
 def locate_go_functions(img: BinaryImage):
     magic = b"\xf1\xff\xff\xff\x00\x00\x01\x08" if img.arch == "x86_64" else b"\xf1\xff\xff\xff\x00\x00\x04\x08"
     want_rev = {v: k for k, v in TARGET_FUNCS.items()}
+    data = img.data
     pos = 0
     while True:
-        idx = img.data.find(magic, pos)
+        idx = data.find(magic, pos)
         if idx == -1:
             break
         pos = idx + 1
-        if idx + 72 > len(img.data):
+        if idx + 72 > len(data):
             continue
         nfunc, nfiles, text_start, funcname_off, cu_off, filetab_off, pctab_off, pcln_off = struct.unpack_from(
-            "<8Q", img.data, idx + 8
+            "<8Q", data, idx + 8
         )
-        if not (1000 < nfunc < 5000000 and funcname_off < len(img.data) and pcln_off < len(img.data)):
+        if not (1000 < nfunc < 5000000 and funcname_off < len(data) and pcln_off < len(data)):
             continue
         ftab_base = idx + pcln_off
         names_base = idx + funcname_off
-        if ftab_base + (nfunc + 1) * 8 > len(img.data):
+        if ftab_base + (nfunc + 1) * 8 > len(data):
             continue
+        names_end = min(len(data), idx + cu_off) if cu_off > funcname_off else len(data)
+        first_foff = struct.unpack_from("<I", data, ftab_base + 4)[0]
+        last_foff = struct.unpack_from("<I", data, ftab_base + (nfunc - 1) * 8 + 4)[0]
+        funcrec_start = ftab_base + first_foff
+        funcrec_end = min(len(data), ftab_base + last_foff + 64)
+
+        def lookup_name_off(noff: int, hint: int = funcrec_start):
+            needle = struct.pack("<i", noff)
+            for start_pos in ((hint, funcrec_start) if hint > funcrec_start else (funcrec_start,)):
+                cur = start_pos
+                while True:
+                    at = data.find(needle, cur, funcrec_end)
+                    if at == -1:
+                        break
+                    i = _bsearch_ftab(data, ftab_base, nfunc, (at - 4) - ftab_base)
+                    if i != -1:
+                        s_off = struct.unpack_from("<I", data, ftab_base + i * 8)[0]
+                        e_off = struct.unpack_from("<I", data, ftab_base + (i + 1) * 8)[0]
+                        return (s_off, e_off), at + 4
+                    cur = at + 1
+            return None, hint
+
         found = {}
+        for k, sym in TARGET_FUNCS.items():
+            at = data.find(b"\x00" + sym.encode() + b"\x00", names_base - 1, names_end)
+            if at == -1 and data.startswith(sym.encode() + b"\x00", names_base):
+                at = names_base - 1
+            if at != -1:
+                bounds, _ = lookup_name_off((at + 1) - names_base)
+                if bounds is not None:
+                    found[k] = bounds
+
         hosts = {}
-        marker = HOST_SYMBOL_MARKER.encode()
-        for i in range(nfunc):
-            entry_off, func_off = struct.unpack_from("<II", img.data, ftab_base + i * 8)
-            func_rec = ftab_base + func_off
-            if func_rec + 8 > len(img.data):
-                continue
-            name_off = struct.unpack_from("<i", img.data, func_rec + 4)[0]
-            if name_off < 0 or names_base + name_off >= len(img.data):
-                continue
-            name_at = names_base + name_off
-            end_s = img.data.find(b"\x00", name_at)
-            if end_s == -1:
-                continue
-            is_host = img.data.find(marker, name_at, end_s) != -1
-            if not is_host and len(found) == len(TARGET_FUNCS):
-                continue
-            next_entry_off = struct.unpack_from("<I", img.data, ftab_base + (i + 1) * 8)[0]
-            if is_host:
-                name = img.data[name_at:end_s].decode("utf-8", errors="replace")
-                if name in want_rev:
-                    found[want_rev[name]] = (entry_off, next_entry_off)
-                else:
-                    hosts[name] = (entry_off, next_entry_off)
-            elif img.data.startswith(b"google3/third_party/", name_at):
-                name = img.data[name_at:end_s].decode("utf-8", errors="replace")
-                if name in want_rev:
-                    found[want_rev[name]] = (entry_off, next_entry_off)
+        if len(found) == len(TARGET_FUNCS):
+            marker = HOST_SYMBOL_MARKER.encode()
+            m_pos = names_base
+            rec_hint = funcrec_start
+            while True:
+                at = data.find(marker, m_pos, names_end)
+                if at == -1:
+                    break
+                s_start = data.rfind(b"\x00", names_base - 1, at)
+                s_start = names_base if s_start == -1 else s_start + 1
+                s_end = data.find(b"\x00", at, names_end)
+                if s_end == -1:
+                    break
+                name = data[s_start:s_end].decode("utf-8", errors="replace")
+                if name not in want_rev:
+                    bounds, rec_hint = lookup_name_off(s_start - names_base, rec_hint)
+                    if bounds is not None:
+                        hosts[name] = bounds
+                m_pos = s_end + 1
         if len(found) == len(TARGET_FUNCS):
             go_text_va = text_start
             if go_text_va == 0:
-                total_len = struct.unpack_from("<I", img.data, ftab_base + nfunc * 8)[0]
+                total_len = struct.unpack_from("<I", data, ftab_base + nfunc * 8)[0]
                 exec_ranges = [(sva, sva + svsize) for _, sva, svsize, _, _, is_exec in img.segments if is_exec]
-                for _, sva, svsize, raw_ptr, raw_size, is_exec in img.segments:
-                    if is_exec:
-                        continue
-                    for off in range(raw_ptr, raw_ptr + raw_size - 16, 8):
-                        minpc, maxpc = struct.unpack_from("<QQ", img.data, off)
-                        if maxpc - minpc == total_len and any(lo <= minpc < hi for lo, hi in exec_ranges):
-                            go_text_va = minpc
+                pcln_va = next((sva + (idx - raw_ptr) for _, sva, _, raw_ptr, raw_size, _ in img.segments
+                                if raw_ptr <= idx < raw_ptr + raw_size), None)
+                if pcln_va is not None:
+                    needle = struct.pack("<Q", pcln_va)
+                    for _, _, _, raw_ptr, raw_size, is_exec in img.segments:
+                        if is_exec or raw_size < 256:
+                            continue
+                        s_pos = raw_ptr
+                        while True:
+                            at = data.find(needle, s_pos, raw_ptr + raw_size - 240)
+                            if at == -1:
+                                break
+                            for m_off in range(at + 8, at + 240, 8):
+                                minpc, maxpc = struct.unpack_from("<QQ", data, m_off)
+                                if maxpc - minpc == total_len and any(lo <= minpc < hi for lo, hi in exec_ranges):
+                                    go_text_va = minpc
+                                    break
+                            if go_text_va != 0:
+                                break
+                            s_pos = at + 1
+                        if go_text_va != 0:
                             break
-                    if go_text_va != 0:
-                        break
+                if go_text_va == 0:
+                    for _, _, _, raw_ptr, raw_size, is_exec in img.segments:
+                        if is_exec:
+                            continue
+                        for off in range(raw_ptr, raw_ptr + raw_size - 16, 8):
+                            minpc, maxpc = struct.unpack_from("<QQ", data, off)
+                            if maxpc - minpc == total_len and any(lo <= minpc < hi for lo, hi in exec_ranges):
+                                go_text_va = minpc
+                                break
+                        if go_text_va != 0:
+                            break
             if go_text_va == 0:
                 raise RuntimeError("Found pclntab but could not resolve Go text base VA from moduledata")
             funcs = {}
@@ -356,8 +417,16 @@ def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_v
     required = {f["symbol"] for f in funcs.values()}
     candidates = [n for n in order_host_candidates(hosts) if n not in required]
     records = {n: describe_function(img, go_text_va, n, *hosts[n]) for n in candidates}
-    references = collect_text_references(img, go_text_va, {r["va_start"] for r in records.values()})
     noop = HOST_NOOP_ENTRY[img.arch]
+    # Fast path for an already-patched binary: if a candidate already carries
+    # the exact patched noop entry and is large enough, return it without a
+    # 75 MB full-text reference scan.
+    for name in candidates:
+        func = records[name]
+        if (func["file_end"] - func["file_start"] >= HOST_SPAN[img.arch]
+                and img.data[func["file_start"] : func["file_start"] + len(noop)] == noop):
+            return func, False
+    references = collect_text_references(img, go_text_va, {r["va_start"] for r in records.values()})
     rejected = []
     first_unclean = None
     for name in candidates:
@@ -372,8 +441,6 @@ def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_v
         if stored_address_present(img, func["va_start"]):
             rejected.append(f"{name}: address stored")
             continue
-        if img.data[func["file_start"] : func["file_start"] + len(noop)] == noop:
-            return func, False          # keep an already patched host stable
         span = img.data[func["file_start"] : func["file_start"] + len(noop)]
         if valid_checkpoint_entry(img, func) and not entry_has_nop_fill(img.arch, span):
             # Switching hosts to dodge an edited prologue would hide the edit.
