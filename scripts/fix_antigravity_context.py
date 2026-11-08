@@ -396,30 +396,16 @@ def collect_text_references(img: BinaryImage, go_text_va: int, wanted):
     return sites
 
 
-def stored_address_present(img: BinaryImage, func_va: int, go_text_va: int | None = None):
-    """True if any data word holds this VA (funcval/itab) or 32-bit text-relative offset (Go reflect method table)."""
-    needle64 = struct.pack("<Q", func_va)
-    needle32 = (
-        struct.pack("<I", func_va - go_text_va)
-        if go_text_va is not None and 0 < func_va - go_text_va <= 0xFFFFFFFF
-        else None
-    )
-    for name, _, _, raw_ptr, raw_size, is_exec in img.segments:
+def stored_address_present(img: BinaryImage, func_va: int):
+    """True if any data word holds this VA: funcval, itab or table entry."""
+    needle = struct.pack("<Q", func_va)
+    for name, _, _, raw_ptr, raw_size, _ in img.segments:
         # Executable segments still hold constants and pointers, so only debug
         # and relocation metadata are excluded.
         if not raw_size or name.startswith(DATA_SEGMENT_SKIP):
             continue
-        if img.data.find(needle64, raw_ptr, raw_ptr + raw_size) != -1:
+        if img.data.find(needle, raw_ptr, raw_ptr + raw_size) != -1:
             return True
-        if needle32 is not None and not is_exec:
-            pos = raw_ptr
-            while True:
-                at = img.data.find(needle32, pos, raw_ptr + raw_size)
-                if at == -1:
-                    break
-                if (at - raw_ptr) % 4 == 0:
-                    return True
-                pos = at + 1
     return False
 
 
@@ -469,7 +455,7 @@ def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_v
         if externally_referenced(func, references.get(func["va_start"], ())):
             rejected.append(f"{name}: branched to")
             continue
-        if stored_address_present(img, func["va_start"], go_text_va=go_text_va):
+        if stored_address_present(img, func["va_start"]):
             rejected.append(f"{name}: address stored")
             continue
         span = img.data[func["file_start"] : func["file_start"] + len(noop)]

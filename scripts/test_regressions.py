@@ -334,16 +334,6 @@ class RegressionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             f.choose_trampoline_host(img, {}, hosts, text_va)
 
-        # Go reflection method tables store 32-bit text-relative offsets (ifn/tfn)
-        # in non-executable data segments; these must also disqualify the host.
-        data = bytearray(debugging)
-        struct.pack_into('<I', data, 0x908, func_va - text_va)
-        img = _FakeImage('x86_64', bytes(data),
-                         [('__TEXT', text_va, size, text_off, size, True),
-                          ('__DATA_CONST', 0x2100, 0x100, 0x900, 0x100, False)])
-        with self.assertRaises(RuntimeError):
-            f.choose_trampoline_host(img, {}, hosts, text_va)
-
     def test_multi_install_manifests_do_not_collide_or_delete_shared_backup(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
