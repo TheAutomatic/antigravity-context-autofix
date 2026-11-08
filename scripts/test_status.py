@@ -152,6 +152,14 @@ class StatusTests(unittest.TestCase):
                 conn.execute('insert into executor_metadata values (0, ?)', (e,))
                 conn.commit()
                 self.assertEqual(f.inspect_context(db_path=path)['state'], state)
+                if gen == 256000 and executor == 256000:
+                    from verify_session import inspect_session
+                    self.assertTrue(inspect_session(db_path=path, expected_limit=256000)['latest_limit_ok'])
+                    self.assertFalse(inspect_session(db_path=path, expected_limit=734000)['latest_limit_ok'])
+                if gen == 734000 and executor == 900000:
+                    from verify_session import inspect_session
+                    self.assertTrue(inspect_session(db_path=path, expected_limit=None)['latest_limit_ok'])
+                    self.assertFalse(inspect_session(db_path=path, expected_limit=734000)['latest_limit_ok'])
             # Also support live sessions where gen_metadata is populated and executor_metadata is empty.
             for gen, state in ((734000, 'EXPECTED_WINDOW'), (900000, 'EXPECTED_WINDOW'), (256000, 'LIMITED_256K')):
                 conn.execute('delete from gen_metadata')

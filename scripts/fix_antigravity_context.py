@@ -50,12 +50,18 @@ TARGET_FUNCS = {
 # any remaining (*CheckpointConfig).Set* method without a call site also works.
 # hooks.checkpointNeeded is never a candidate: native auto-compaction lives there.
 HOST_SYMBOL_MARKER = "cortex_pb/cortex_go_proto.(*CheckpointConfig)."
+HOST_FALLBACK_SYMBOLS = (
+    "google3/third_party/jetski/language_server/jetbox_state_store/jetbox_state_store.forwardChanges",
+    "google3/third_party/jetski/language_server/auth_client/authclient.closeListeners",
+    "google3/third_party/jetski/cortex/implicit/implicit.recordCortexTrajectory",
+    "google3/third_party/jetski/language_server/streaming/streaming.(*CompletionStreamer).Close",
+)
 HOST_PREFERENCE = (
     "(*CheckpointConfig).SetSessionSummaryPromptOverride",
     "(*CheckpointConfig).SetContextWindow",
     "(*CheckpointConfig).SetCheckpointPromptOverride",
     "(*CheckpointConfig).SetContinuationPromptOverride",
-)
+) + HOST_FALLBACK_SYMBOLS
 HOST_SPAN = {"x86_64": 0x20 + 46, "arm64": 0x20 + 48}  # entry + 0x20 + trampoline
 HOST_NOOP_ENTRY = {
     "x86_64": bytes.fromhex("31c031db31c9c3"),
@@ -254,6 +260,14 @@ def locate_go_functions(img: BinaryImage):
                     if bounds is not None:
                         hosts[name] = bounds
                 m_pos = s_end + 1
+            for fb_sym in HOST_FALLBACK_SYMBOLS:
+                at = data.find(b"\x00" + fb_sym.encode() + b"\x00", names_base - 1, names_end)
+                if at == -1 and data.startswith(fb_sym.encode() + b"\x00", names_base):
+                    at = names_base - 1
+                if at != -1:
+                    bounds, _ = lookup_name_off((at + 1) - names_base)
+                    if bounds is not None:
+                        hosts[fb_sym] = bounds
         if len(found) == len(TARGET_FUNCS):
             go_text_va = text_start
             if go_text_va == 0:
@@ -380,16 +394,30 @@ def collect_text_references(img: BinaryImage, go_text_va: int, wanted):
     return sites
 
 
-def stored_address_present(img: BinaryImage, func_va: int):
-    """True if any data word holds this VA: funcval, itab or table entry."""
-    needle = struct.pack("<Q", func_va)
+def stored_address_present(img: BinaryImage, func_va: int, go_text_va: int | None = None):
+    """True if any data word holds this VA (funcval/itab) or 32-bit text-relative offset (Go reflect method table)."""
+    needle64 = struct.pack("<Q", func_va)
+    needle32 = (
+        struct.pack("<I", func_va - go_text_va)
+        if go_text_va is not None and 0 < func_va - go_text_va <= 0xFFFFFFFF
+        else None
+    )
     for name, _, _, raw_ptr, raw_size, is_exec in img.segments:
         # Executable segments still hold constants and pointers, so only debug
         # and relocation metadata are excluded.
         if not raw_size or name.startswith(DATA_SEGMENT_SKIP):
             continue
-        if img.data.find(needle, raw_ptr, raw_ptr + raw_size) != -1:
+        if img.data.find(needle64, raw_ptr, raw_ptr + raw_size) != -1:
             return True
+        if needle32 is not None and not is_exec:
+            pos = raw_ptr
+            while True:
+                at = img.data.find(needle32, pos, raw_ptr + raw_size)
+                if at == -1:
+                    break
+                if (at - raw_ptr) % 4 == 0:
+                    return True
+                pos = at + 1
     return False
 
 
@@ -439,7 +467,7 @@ def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_v
         if externally_referenced(func, references.get(func["va_start"], ())):
             rejected.append(f"{name}: branched to")
             continue
-        if stored_address_present(img, func["va_start"]):
+        if stored_address_present(img, func["va_start"], go_text_va=go_text_va):
             rejected.append(f"{name}: address stored")
             continue
         span = img.data[func["file_start"] : func["file_start"] + len(noop)]
@@ -1216,7 +1244,9 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
     info["backup_path"] = str(backup_file)
     info["version"] = ver
 
-    manifest_file = backup_dir / f"{target.name}-{ver}-manifest-{info['sha256'][:16]}.json"
+    resolved_target = _resolved(target) or target
+    path_tag = hashlib.sha256(os.path.normcase(str(resolved_target)).encode("utf-8")).hexdigest()[:8]
+    manifest_file = backup_dir / f"{target.name}-{ver}-manifest-{info['sha256'][:16]}-{path_tag}.json"
 
     fd, tmp_path_str = tempfile.mkstemp(prefix=f".{target.name}-patch-", dir=str(target.parent))
     tmp_path = Path(tmp_path_str)
@@ -1244,17 +1274,29 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
         info["patched_size"] = tmp_path.stat().st_size
         # Persist the record that identifies the new hash before the binary can
         # land, so a successful replacement always has a restore entry; drop it
-        # again when nothing was written.
+        # again only when the target on disk is confirmed untouched/rolled back.
         previous_manifest = manifest_file.read_bytes() if manifest_file.exists() else None
         write_manifest(manifest_file, info)
         try:
             replace_with_retry(tmp_path, target, target_disk_sha256, rollback_bytes=rollback_bytes)
         except BaseException:
-            if hashlib.sha256(target.read_bytes()).hexdigest() != patched_sha256:
+            try:
+                disk_now_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+            except OSError:
+                disk_now_sha256 = None
+            if disk_now_sha256 == target_disk_sha256:
                 if previous_manifest is None:
                     manifest_file.unlink(missing_ok=True)
                 else:
                     manifest_file.write_bytes(previous_manifest)
+            elif disk_now_sha256 != patched_sha256:
+                info["interrupted_write"] = True
+                if disk_now_sha256:
+                    info["corrupted_disk_sha256"] = disk_now_sha256
+                try:
+                    write_manifest(manifest_file, info)
+                except OSError:
+                    pass
             raise
     except PermissionError as e:
         raise RuntimeError(
@@ -1306,6 +1348,12 @@ def restore_target(target: Path, backup_dir: Path):
     update_agy_sidecar_if_present(target)
     if hashlib.sha256(target.read_bytes()).hexdigest() != mdata["sha256"]:
         raise RuntimeError(f"Restored file hash mismatch: {target}")
+    if mdata.get("interrupted_write") or "corrupted_disk_sha256" in mdata:
+        cleaned = {k: v for k, v in mdata.items() if k not in ("interrupted_write", "corrupted_disk_sha256")}
+        try:
+            write_manifest(mf, cleaned)
+        except OSError:
+            pass
     print(f"  [restored] Restored original {mdata['sha256']} from {bak}")
     return {"path": str(target), "operation": "restore", "status": "RESTORED",
             "before_sha256": before_sha256, "restored_sha256": mdata["sha256"],
@@ -1701,6 +1749,8 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
 
 def select_restore_backup(target, backup_dir, current=None):
     current = current or hashlib.sha256(target.read_bytes()).hexdigest()
+    target_resolved = _resolved(target)
+    corrupted_match = None
     for path in sorted(backup_dir.glob(f"{target.name}-*-manifest-*.json"), reverse=True):
         try:
             manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -1709,14 +1759,25 @@ def select_restore_backup(target, backup_dir, current=None):
             original = manifest["sha256"]
             if not isinstance(original, str) or len(original) != 64 or any(c not in "0123456789abcdef" for c in original):
                 raise ValueError("Invalid original SHA256")
-            if current not in (manifest.get("patched_sha256"), original):
-                continue
             backup = Path(manifest["backup_path"])
             if not backup.is_file() or hashlib.sha256(backup.read_bytes()).hexdigest() != original:
                 raise ValueError("Backup missing or hash mismatch")
-            return path, manifest, backup
+            if current in (manifest.get("patched_sha256"), original):
+                return path, manifest, backup
+            recorded = manifest.get("path")
+            recorded_resolved = _resolved(Path(recorded)) if isinstance(recorded, str) and recorded else None
+            corrupted_sha = _manifest_hash(manifest.get("corrupted_disk_sha256"))
+            if (corrupted_match is None
+                    and target_resolved is not None
+                    and recorded_resolved == target_resolved
+                    and manifest.get("interrupted_write") is True
+                    and corrupted_sha
+                    and current == corrupted_sha):
+                corrupted_match = (path, manifest, backup)
         except (ValueError, TypeError, KeyError, OSError) as exc:
             print(f"  [backup warning] Skipping invalid manifest {path}: {exc}")
+    if corrupted_match is not None:
+        return corrupted_match
     raise RuntimeError(f"No verified matching backup for {target} in {backup_dir}")
 
 
@@ -1810,15 +1871,17 @@ def prune_old_backups(backup_dir: Path, targets) -> list:
     base = _resolved(backup_dir)
     if base is None or not base.is_dir():
         return []
-    installed, current = set(), {}
+    installed, current, path_hash = set(), {}, {}
     for target in targets:
         resolved = _resolved(target)
         if resolved is None:
             continue
         try:
-            current.setdefault(resolved.name, set()).add(hashlib.sha256(resolved.read_bytes()).hexdigest())
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
         except OSError:
             continue
+        current.setdefault(resolved.name, set()).add(digest)
+        path_hash[resolved] = digest
         installed.add(resolved)
     entries = []
     for manifest in sorted(base.glob("*manifest*.json")):
@@ -1831,10 +1894,13 @@ def prune_old_backups(backup_dir: Path, targets) -> list:
     keep, stale = set(), []
     for manifest, data in entries:
         hashes = current.get(manifest.name.split("-", 1)[0])
-        if not hashes:
-            continue            # no such binary installed here: not ours to judge
         backup = data.get("backup_path")
         backup_path = Path(backup) if isinstance(backup, str) and backup else None
+        if not hashes:
+            keep.add(manifest)
+            if backup_path:
+                keep.add(backup_path)
+            continue            # no such binary installed here: not ours to judge
         original = _manifest_hash(data.get("sha256"))
         patched = _manifest_hash(data.get("patched_sha256"))
         recorded = data.get("path")
@@ -1846,7 +1912,8 @@ def prune_old_backups(backup_dir: Path, targets) -> list:
             if backup_path:
                 keep.add(backup_path)
             continue
-        if patched in hashes or original in hashes:
+        installed_digest = path_hash.get(recorded_path)
+        if installed_digest in (patched, original):
             keep.add(manifest)
             if backup_path:
                 keep.add(backup_path)

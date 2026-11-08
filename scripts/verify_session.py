@@ -293,7 +293,11 @@ def inspect_session(conversation_id=None, expected_limit=None, db_path=None):
     if model_name_last:
         latest_turn["model_name"] = model_name_last
 
-    exec_ok = (exec_limit_last is None) or (exec_limit_last in ACCEPTED_LIMITS)
+    exec_ok = (
+        (exec_limit_last is None) or (exec_limit_last in ACCEPTED_LIMITS)
+        if expected_limit is None
+        else ((exec_limit_last is None) or (exec_limit_last == expected_limit))
+    )
     report = {
         "read_mode": read_mode,
         "db_path": str(db_path),

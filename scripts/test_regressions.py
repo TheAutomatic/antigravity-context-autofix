@@ -334,6 +334,110 @@ class RegressionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             f.choose_trampoline_host(img, {}, hosts, text_va)
 
+        # Go reflection method tables store 32-bit text-relative offsets (ifn/tfn)
+        # in non-executable data segments; these must also disqualify the host.
+        data = bytearray(debugging)
+        struct.pack_into('<I', data, 0x908, func_va - text_va)
+        img = _FakeImage('x86_64', bytes(data),
+                         [('__TEXT', text_va, size, text_off, size, True),
+                          ('__DATA_CONST', 0x2100, 0x100, 0x900, 0x100, False)])
+        with self.assertRaises(RuntimeError):
+            f.choose_trampoline_host(img, {}, hosts, text_va)
+
+    def test_multi_install_manifests_do_not_collide_or_delete_shared_backup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            bdir = root / 'backups'
+            bdir.mkdir()
+            dir_a, dir_b = root / 'install_a', root / 'install_b'
+            dir_a.mkdir()
+            dir_b.mkdir()
+            target_a, target_b = dir_a / 'agy.exe', dir_b / 'agy.exe'
+            original = b'shared-original-bytes'
+            target_a.write_bytes(original)
+            target_b.write_bytes(original)
+            orig_sha = hashlib.sha256(original).hexdigest()
+
+            def make_plan(t):
+                return {
+                    'path': str(t), 'format': 'PE', 'arch': 'x86_64', 'size': len(original),
+                    'sha256': orig_sha, 'pclntab_offset': '0x0', 'go_text_va': '0x0',
+                    'status': 'UNPATCHED', 'field_offsets': {}, 'functions': {},
+                    'changes': [{'name': 'x', 'purpose': 'test', 'va': '0x0', 'offset': '0x0',
+                                 'before': f'{original[0]:02x}', 'after': '58', 'fixed_before': True}],
+                }
+
+            with patch.object(f, 'analyze_binary', side_effect=lambda t, **kw: (
+                    {'status': 'ALREADY_PATCHED'} if t.read_bytes().startswith(b'X') else make_plan(t))), \
+                 patch.object(f, 'get_binary_version', return_value='1.5.0'), \
+                 patch.object(f, 'wait_for_backends'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                f.patch_target(target_a, bdir)
+                f.patch_target(target_b, bdir)
+
+            manifests = list(bdir.glob('agy.exe-1.5.0-manifest-*.json'))
+            self.assertEqual(len(manifests), 2, 'each installation path must have its own manifest')
+
+            # Upgrade B to a new build and prune only B: A's manifest and the shared
+            # original .bak must survive so A can still be restored.
+            target_b.write_bytes(b'upgraded-new-build-bytes')
+            f.prune_old_backups(bdir, [target_b])
+            self.assertTrue(f.find_restore_backup(target_a, bdir).is_file())
+            with patch.object(f, 'wait_for_backends'), contextlib.redirect_stdout(io.StringIO()):
+                f.restore_target(target_a, bdir)
+            self.assertEqual(target_a.read_bytes(), original)
+
+    def test_interrupted_inplace_write_keeps_manifest_and_allows_restore(self):
+        class WinError6(OSError):
+            winerror = 6
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target, backup_dir = root / 'agy.exe', root / 'backups'
+            backup_dir.mkdir()
+            original = b'pristine-original-bytes'
+            target.write_bytes(original)
+            orig_sha = hashlib.sha256(original).hexdigest()
+            plan = {
+                'path': str(target), 'format': 'PE', 'arch': 'x86_64', 'size': len(original),
+                'sha256': orig_sha, 'pclntab_offset': '0x0', 'go_text_va': '0x0',
+                'status': 'UNPATCHED', 'field_offsets': {}, 'functions': {},
+                'changes': [{'name': 'x', 'purpose': 'test', 'va': '0x0', 'offset': '0x0',
+                             'before': f'{original[0]:02x}', 'after': '58', 'fixed_before': True}],
+            }
+
+            def fail_both(dest, payload):
+                dest.write_bytes(b'corrupted-partial-write')
+                raise OSError(28, 'No space left on device')
+
+            with patch.object(f, 'analyze_binary', return_value=plan), \
+                 patch.object(f, 'get_binary_version', return_value='1.5.0'), \
+                 patch.object(f, 'wait_for_backends'), \
+                 patch.object(f, 'is_windows', return_value=True), \
+                 patch.object(f, '_replace_atomic', side_effect=WinError6(6, 'invalid handle')), \
+                 patch.object(f, '_overwrite_file', side_effect=fail_both), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    f.patch_target(target, backup_dir)
+
+            self.assertEqual(target.read_bytes(), b'corrupted-partial-write')
+            # If the user replaces the binary with a new unrelated build before
+            # running --restore, the old interrupted manifest must NOT match it.
+            target.write_bytes(b'brand-new-upgraded-build')
+            with self.assertRaises(RuntimeError):
+                f.find_restore_backup(target, backup_dir)
+
+            # When the file still carries the exact recorded corrupted hash,
+            # --restore recovers it and clears the interrupted_write markers.
+            target.write_bytes(b'corrupted-partial-write')
+            self.assertTrue(f.find_restore_backup(target, backup_dir).is_file())
+            with patch.object(f, 'wait_for_backends'), contextlib.redirect_stdout(io.StringIO()):
+                restored = f.restore_target(target, backup_dir)
+            self.assertEqual(target.read_bytes(), original)
+            saved_manifest = json.loads(Path(restored['manifest_path']).read_text(encoding='utf-8'))
+            self.assertNotIn('interrupted_write', saved_manifest)
+            self.assertNotIn('corrupted_disk_sha256', saved_manifest)
+
     @unittest.skipUnless(os.environ.get('AGY_TEST_BINARY'), 'provide an original binary fixture')
     def test_trampoline_host_falls_back_when_preferred_symbols_are_absent(self):
         source = Path(os.environ['AGY_TEST_BINARY'])
