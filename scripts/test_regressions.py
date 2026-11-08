@@ -102,6 +102,15 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(writes)
             self.assertEqual(writes[-1], current)
 
+    def test_preflight_passes_custom_backup_dir_to_analyze_binary(self):
+        target = Path('agy').resolve()
+        custom_bdir = Path('/tmp/custom-agy-backups').resolve()
+        with patch.object(f, 'analyze_binary', return_value={'path': str(target), 'status': 'UNPATCHED', 'changes': [], 'format': 'Mach-O', 'arch': 'arm64', 'sha256': '0'*64, 'functions': {'trampolineHost': {'symbol': 'pkg.Host'}}}) as analyze, \
+             patch.object(f, 'inspect_contexts', return_value=[{'state': 'UNKNOWN', 'error': 'none'}]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            f.preflight([target], backup_dir=custom_bdir)
+        analyze.assert_called_once_with(target, backup_dir=custom_bdir)
+
     def test_replace_refuses_truncating_write_without_rollback(self):
         class WinError6(OSError):
             winerror = 6
@@ -440,6 +449,12 @@ class RegressionTests(unittest.TestCase):
         for data in malformed:
             with self.subTest(data=data), self.assertRaises(ValueError):
                 v.parse_gen_row(data)
+        for bad_model_field in (
+            field(1, field(3, b'wrong wire') + chat),
+            field(1, chat + field(19, 12345)),
+        ):
+            with self.subTest(data=bad_model_field), self.assertRaises(ValueError):
+                v.parse_gen_row(bad_model_field)
         for data in (bytes([0x80]), bytes([0xff]) * 10, bytes([0x80]) * 10 + bytes([0])):
             with self.assertRaises(ValueError):
                 v.read_varint(data, 0)

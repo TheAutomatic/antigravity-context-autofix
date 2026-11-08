@@ -4,10 +4,9 @@ Read-only verifier for Antigravity IDE / Desktop / CLI SQLite conversation datab
 Checks:
 - Both ~/.gemini/antigravity/conversations/<cid>.db and ~/.gemini/antigravity-cli/conversations/<cid>.db
 - Latest turn (and idx=0) gen_metadata ChatStartMetadata.ContextWindowMetadata.max_context_tokens:
-  the checkpoint budget this patch sets, 900000 (983040 on older patches)
-- Latest turn (and idx=0) executor_metadata Config.max_token_limit: same budget after clamping;
-  rows recorded before a restart still carry 983040
-Both sides must be one of ACCEPTED_LIMITS; 256000 stays LIMITED_256K.
+  the checkpoint budget this patch sets, 734000 (900000 / 983040 on older patches)
+- Latest turn (and idx=0) executor_metadata Config.max_token_limit when present (live sessions may omit executor_metadata rows)
+Both sides (when present) must be one of ACCEPTED_LIMITS; 256000 stays LIMITED_256K.
 """
 
 from __future__ import annotations
@@ -20,8 +19,8 @@ import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
-# Checkpoint budget written by the patch, or the pre-900K patched ceiling.
-ACCEPTED_LIMITS = (900000, 983040)
+# Checkpoint budget written by the patch (734000 = 0.70 * 1M), or older 900K / 983040 patched ceilings.
+ACCEPTED_LIMITS = (734000, 900000, 983040)
 
 
 def read_varint(b: bytes, p: int):
@@ -113,17 +112,33 @@ def find_conversation_db(cid: str | None) -> Path:
 
 def parse_gen_usage(g: bytes):
     chat = get_field(g, 1)
-    window = get_field(get_field(chat, 9), 10)
+    chat_fields = list(iter_fields(chat))
+    window_parents = [(w, v) for f, w, v in chat_fields if f == 9]
+    if not window_parents:
+        raise ValueError("Missing protobuf field 9")
+    if any(w != 2 for w, _ in window_parents):
+        raise ValueError("Unexpected wire type for protobuf field 9")
+    window = get_field(window_parents[-1][1], 10)
     gen_limit = get_field(window, 4, wire=0)
     used_vals = [(w, v) for f, w, v in iter_fields(window) if f == 1]
     if any(w != 0 for w, _ in used_vals):
         raise ValueError("Unexpected wire type for protobuf field 1")
     gen_used = used_vals[-1][1] if used_vals else None
-    return chat, gen_limit, gen_used
+    model_id_vals = [(w, v) for f, w, v in chat_fields if f == 3]
+    if any(w != 0 for w, _ in model_id_vals):
+        raise ValueError("Unexpected wire type for protobuf field 3")
+    model_name_vals = [(w, v) for f, w, v in chat_fields if f == 19]
+    if any(w != 2 for w, _ in model_name_vals):
+        raise ValueError("Unexpected wire type for protobuf field 19")
+    model_info = (
+        model_id_vals[-1][1] if model_id_vals else None,
+        model_name_vals[-1][1].decode("utf-8", errors="replace") if model_name_vals else None,
+    )
+    return chat, gen_limit, gen_used, model_info
 
 
 def parse_gen_row(g: bytes):
-    chat, gen_limit, _ = parse_gen_usage(g)
+    chat, gen_limit, _, _ = parse_gen_usage(g)
     return chat, gen_limit
 
 
@@ -227,51 +242,69 @@ def inspect_session(conversation_id=None, expected_limit=None, db_path=None):
     db_path = db_path.expanduser().resolve() if db_path else find_conversation_db(conversation_id)
     with open_session_db(db_path) as (conn, read_mode):
         conn.execute("BEGIN")
-        if not conn.execute("select 1 from gen_metadata limit 1").fetchone() or not conn.execute("select 1 from executor_metadata limit 1").fetchone():
+        if not conn.execute("select 1 from gen_metadata limit 1").fetchone():
             raise ValueError("Session has no request metadata yet")
         g_first_idx, g_first = conn.execute("select idx, data from gen_metadata order by idx asc limit 1").fetchone()
         g_last_idx, g_last = conn.execute("select idx, data from gen_metadata order by idx desc limit 1").fetchone()
-        _, gen_limit_first, gen_used_first = parse_gen_usage(g_first)
-        _, gen_limit_last, gen_used_last = parse_gen_usage(g_last)
+        _, gen_limit_first, gen_used_first, _ = parse_gen_usage(g_first)
+        _, gen_limit_last, gen_used_last, (model_id_last, model_name_last) = parse_gen_usage(g_last)
 
-        e_first_idx, e_first = conn.execute("select idx, data from executor_metadata order by idx asc limit 1").fetchone()
-        e_last_idx, e_last = conn.execute("select idx, data from executor_metadata order by idx desc limit 1").fetchone()
-        exec_limit_first = parse_exec_row(e_first)
-        exec_limit_last = parse_exec_row(e_last)
+        e_rows = conn.execute(
+            "select idx, data from executor_metadata where idx in "
+            "((select min(idx) from executor_metadata), (select max(idx) from executor_metadata)) "
+            "order by idx asc"
+        ).fetchall()
+        if e_rows:
+            e_first_idx, e_first = e_rows[0]
+            e_last_idx, e_last = e_rows[-1]
+            exec_limit_first = parse_exec_row(e_first)
+            exec_limit_last = parse_exec_row(e_last)
+            has_executor = True
+        else:
+            has_executor = False
         project_folder = get_project_folder(conn)
         preview = get_conversation_preview(db_path, conn=conn)
 
     first_turn = {
         "gen_idx": g_first_idx,
         "gen_max_context_tokens": gen_limit_first,
-        "executor_idx": e_first_idx,
-        "executor_max_token_limit": exec_limit_first,
     }
+    if has_executor:
+        first_turn["executor_idx"] = e_first_idx
+        first_turn["executor_max_token_limit"] = exec_limit_first
     if gen_used_first is not None:
         first_turn["gen_used_tokens"] = gen_used_first
 
     latest_turn = {
         "gen_idx": g_last_idx,
         "gen_max_context_tokens": gen_limit_last,
-        "executor_idx": e_last_idx,
-        "executor_max_token_limit": exec_limit_last,
     }
+    if has_executor:
+        latest_turn["executor_idx"] = e_last_idx
+        latest_turn["executor_max_token_limit"] = exec_limit_last
+    else:
+        exec_limit_last = None
     if gen_used_last is not None:
         latest_turn["gen_used_tokens"] = gen_used_last
         if gen_limit_last:
             latest_turn["gen_usage_percent"] = round(gen_used_last / gen_limit_last * 100.0, 1)
+    if model_id_last is not None:
+        latest_turn["model_id"] = model_id_last
+    if model_name_last:
+        latest_turn["model_name"] = model_name_last
 
+    exec_ok = (exec_limit_last is None) or (exec_limit_last in ACCEPTED_LIMITS)
     report = {
         "read_mode": read_mode,
         "db_path": str(db_path),
         "conversation_id": db_path.stem,
         "first_turn": first_turn,
         "latest_turn": latest_turn,
-        "expected_limit": 900000 if expected_limit is None else expected_limit,
+        "expected_limit": 734000 if expected_limit is None else expected_limit,
         "latest_limit_ok": (
-            gen_limit_last in ACCEPTED_LIMITS and exec_limit_last in ACCEPTED_LIMITS
+            gen_limit_last in ACCEPTED_LIMITS and exec_ok
             if expected_limit is None
-            else (gen_limit_last == expected_limit and exec_limit_last in ACCEPTED_LIMITS)
+            else (gen_limit_last == expected_limit and exec_ok)
         ),
     }
     if project_folder:
@@ -285,7 +318,7 @@ def main():
     ap = argparse.ArgumentParser(description="Read actual request context window from the session DB.")
     ap.add_argument("conversation_id", nargs="?", help="Conversation UUID (omit to inspect the newest .db automatically)")
     ap.add_argument("--db", type=Path, help="Read an explicit conversation database")
-    ap.add_argument("--expected-limit", type=int, default=None, help="Expected max_context_tokens (default: 900000 or 983040)")
+    ap.add_argument("--expected-limit", type=int, default=None, help="Expected max_context_tokens (default: 734000, 900000 or 983040)")
     args = ap.parse_args()
     if args.db and args.conversation_id:
         ap.error("Choose --db or conversation_id, not both")

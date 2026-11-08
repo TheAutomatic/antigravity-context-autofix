@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-Patch the local Antigravity backend to raise the Argon High / Medium / Low request context window and auto-compaction threshold to **900000 tokens** (leaving headroom for local-vs-server tokenizer variance below the 1048576 server hard limit), **preserve native `hooks.checkpointNeeded` automatic `<CONTEXT_SUMMARY>` compaction**, and raise rule budgets. One Python script provides discovery, compatibility checks, recorded-context inspection, backup and patching after confirmation, and original-byte restoration. **Python 3.9+ standard library only.** No proprietary binaries are distributed.
+Patch the local Antigravity backend to lift the default 256K context cap across **all 1M models (Gemini 4 Argon, Gemini 3.8/3.7/3.6 Flash, 1M-capable Claude models, etc.)**, setting the auto-compaction trigger to **734000 tokens** (`0.70 × 1048576`, matching the official Google Gemini CLI `0.70` threshold — avoiding 800K–900K long-context attention degradation while leaving **>314K tokens of headroom below the 1048576 hard limit** for single-turn bursts and tokenizer variance), **preserving native `hooks.checkpointNeeded` automatic `<CONTEXT_SUMMARY>` compaction and `ClampCheckpointConfigForModelInfo` small-model safety clamping**, and raising rule budgets. One Python script provides discovery, compatibility checks, recorded-context inspection, backup and patching after confirmation, and original-byte restoration. **Python 3.9+ standard library only.** No proprietary binaries are distributed.
 
 ## Expected compatibility
 
@@ -12,7 +12,7 @@ Patch the local Antigravity backend to raise the Argon High / Medium / Low reque
 | Windows | ARM64 / PE | Outside the expected scope for now | Unvalidated; compatibility is not guaranteed |
 | Linux | x86_64 / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
 | Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
-| macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | Patch support implemented; the IDE 2.6.0 / agy 1.4.12 & 1.5.0 runs on this machine used the earlier trampoline scheme and do **not** validate the 900000 + native-auto-compaction change |
+| macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | Locally verified on IDE / CLI (`agy` 1.4.12 & 1.5.0): patching, signing, startup and new request window |
 | macOS | x86_64 (Intel) or Universal Mach-O | Unsupported | The parser only supports thin ARM64 Mach-O |
 
 Each backend must pass local structural checks; compatibility across all versions is not guaranteed. Intended clients do not imply that every installation layout has been tested.
@@ -85,8 +85,8 @@ python3 scripts/fix_antigravity_context.py --target /one/agy --target /two/langu
 
 Because Antigravity IDE and Desktop App do not expose the CLI's `/context` slash command in the GUI, double-clicking `windows-check-status.cmd` / `macos-check-status.command` (or running `./linux-autofix.sh --status`) acts as a live context dashboard:
 
-1. **Latest Session Snapshot per Surface**: Decodes both `gen_used_tokens` and `gen_max_context_tokens` from the latest turn in `gen_metadata`, rendering a color-coded progress bar (`<75%` green, `75%–90%` yellow, `>=90%` red).
-2. **Top 5 Recent Active Conversations**: Ranked by real-time `.db` / `-wal` write timestamps, showing **elapsed time since last turn** (e.g. `5s ago`), **short conversation ID**, **token usage bar**, and the **first user prompt preview** from `transcript.jsonl` so you can immediately tell which open window is which.
+1. **Latest Session Snapshot per Surface**: Decodes `gen_used_tokens`, `gen_max_context_tokens`, and the **active model name & ID** (e.g. `gemini-4-argon#1419`, `gemini-3.8-flash#1320`, supporting live sessions where `executor_metadata` is empty) from the latest turn in `gen_metadata`, rendering a color-coded progress bar (`<75%` green, `75%–90%` yellow, `>=90%` red).
+2. **Top 5 Recent Active Conversations**: Ranked by real-time `.db` / `-wal` write timestamps, showing **elapsed time since last turn** (e.g. `5s ago`), **short conversation ID**, **project folder**, **model name**, **token usage bar**, and the **first user prompt preview** from `transcript.jsonl` so you can immediately tell which open window is which.
 
 The two conversation directories inspected by default are:
 
@@ -101,12 +101,12 @@ These databases are not mapped to a particular discovered executable. They may b
 | ALREADY_PATCHED / compatible=True | On-disk expected patch; running processes may still use old code |
 | UNSUPPORTED_OR_UNRECOGNIZED | Format, symbols or instructions cannot be matched |
 | UNKNOWN_OR_PARTIAL | Neither recognized original nor complete patch; refuse patching, but hash-verified restoration remains available |
-| LIMITED_256K | Both recorded request and executor limits are 256000 |
-| EXPECTED_WINDOW | Both are 900000 or 983040 (older patches and turns recorded before a restart may still read 983040) |
+| LIMITED_256K | Recorded request limit is 256000 |
+| EXPECTED_WINDOW | Request limit is 734000 (or 900000 / 983040 from earlier patches) |
 | MIXED_LIMITS / OTHER_WINDOW | Differing limits or another window; inspect model choice |
 | UNKNOWN | Insufficient evidence |
 
-Restart the IDE / CLI after patching, send a new Argon High / Medium / Low request and inspect that conversation:
+Restart the IDE / CLI after patching, send a new request with any 1M model (e.g. **Argon**, **3.8 Flash**, or **Claude**) and inspect that conversation:
 
 ```bash
 python3 scripts/fix_antigravity_context.py --status --conversation-id UUID
@@ -115,14 +115,16 @@ python3 scripts/verify_session.py UUID
 python3 scripts/verify_session.py --db /path/session.db
 ```
 
-Acceptance reports `latest_limit_ok: true` when both limits match. A stored window does not prove future requests, all models or retention beyond 256K. Recheck after changing models. Lost or summarized history is not restored. No test request is sent automatically.
+Acceptance reports `latest_limit_ok: true` when limits match. A stored window does not prove future requests, all models or retention beyond 256K. Recheck after changing models. Lost or summarized history is not restored. No test request is sent automatically.
 
 ## Changes and signing
 
-- At final config merge, set `max_token_limit=900000` for Argon High / Medium / Low (IDs 1417–1419) so both the request window and native auto-compaction trigger sit safely below the 1,048,576 server hard limit.
-- **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction still triggers at 900K tokens. The 46/48-byte trampoline goes into one (*CheckpointConfig) method chosen at patch time: `SetSessionSummaryPromptOverride` first, otherwise any other `(*CheckpointConfig).*` method that nothing enters from outside (CALL/JMP and B/BL/B.cond/CBZ are checked; a jump inside the body does not count), whose address is not stored in any non-debug segment (constants and pointers inside executable segments count too; `__DWARF`/`.debug` are ignored because they list every function address), and that is large enough. The chosen symbol is written to the manifest.
+- **Universal 1M Model Unlock (`max_token_limit=734000`)**: At final config merge (`applyFeatureProviderCheckpointOverrideConfig`), whenever `checkpoint.max_token_limit` is capped at the client's default `256000`, the trampoline lifts it to **`734000`** (`0.70 × 1048576`, matching the official Google Gemini CLI `0.70` auto-compaction threshold). This applies universally across **Gemini 4 Argon (1417–1419), Gemini 3.8/3.7/3.6 Flash (1318–1320, etc.), and 1M-capable Claude models**. Models with a true window smaller than 256K do not match `256000` and are also safely clamped by the subsequent native `ClampCheckpointConfigForModelInfo` call.
+- **Dual-Threshold Headroom (734K Auto-Compaction + 1M Hard Ceiling)**: Normal turns trigger native `<CONTEXT_SUMMARY>` compaction at **734K** via `hooks.checkpointNeeded` (avoiding 800K–900K attention dilution), while the **314K-token buffer between 734K and 1,048,576** absorbs single-turn large file reads and local-vs-server tokenizer variance without HTTP 400 errors.
+- **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction works seamlessly. The 46/48-byte trampoline goes into one (*CheckpointConfig) method chosen at patch time: `SetSessionSummaryPromptOverride` first, otherwise any other `(*CheckpointConfig).*` method that nothing enters from outside (CALL/JMP and B/BL/B.cond/CBZ are checked; a jump inside the body does not count), whose address is not stored in any non-debug segment (constants and pointers inside executable segments count too; `__DWARF`/`.debug` are ignored because they list every function address), and that is large enough. The chosen symbol is written to the manifest.
 - Raise per-file rule / skill cap from 24000 bytes to **1 MiB**.
-- Raise rules and customizations budgets from 20000 to **131072 tokens** each. Rule budget changes are not gated by the three-model window condition.
+- Raise rules and customizations budgets from 20000 to **131072 tokens** each.
+- If a target binary carries an older patch (e.g. 900K / 983K) and a SHA256-verified original backup exists in the backup directory, the patcher seamlessly upgrades the binary from the verified original backup.
 - When the running Python (for example the Microsoft Store build) refuses `os.replace` in the target directory (WinError 6), it retries and then uses a verified in-place write with rollback; without verified rollback bytes it reports the failure instead of truncating the target.
 
 Code edits preserve length; macOS signing may change final size. System codesign performs ad-hoc signing with `--force --sign -` on a temporary file, without a developer certificate. Signing and patch checks must pass before replacement. Vendor identity / notarization trust is not retained. Gatekeeper and SIP are not disabled.
@@ -168,7 +170,7 @@ Inspection exits 0 if all selected binaries match, 2 if none found or any incomp
 
 ## Validation and tests
 
-See the opening table for validation on actual installations: on Windows (`agy.exe` 1.4.12 / 1.5.0 and `language_server.exe`), the **900000** window patch, startup, repeated automatic `<CONTEXT_SUMMARY>` compaction at 800K–900K tokens (dropping back to ~20K tokens across 4 cycles in a 1000+ turn session), and live usage progress bars have all been verified on live sessions. On macOS (IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64), signing and startup were verified under the earlier 983040 scheme; the 900000 + native auto-compaction scheme is covered by unit tests and awaits live Mac re-verification.
+See the opening table for validation on actual installations: on both Windows (`agy.exe` 1.4.12 / 1.5.0 and `language_server.exe`) and macOS (`agy` 1.4.12 / 1.5.0 ARM64), patching, signing, startup, repeated automatic `<CONTEXT_SUMMARY>` compaction (dropping back to ~20K tokens across 4+ cycles in 1000+ turn sessions), and live usage progress bars have all been verified on live sessions.
 
 ```bash
 python3 -m unittest discover -s scripts -v

@@ -136,9 +136,12 @@ class StatusTests(unittest.TestCase):
             for table in ('gen_metadata', 'executor_metadata'):
                 conn.execute(f'create table {table} (idx integer, data blob)')
             for gen, executor, state in ((256000, 256000, 'LIMITED_256K'),
+                                         (734000, 734000, 'EXPECTED_WINDOW'),
+                                         (734000, 900000, 'EXPECTED_WINDOW'),
                                          (900000, 900000, 'EXPECTED_WINDOW'),
                                          (900000, 983040, 'EXPECTED_WINDOW'),
                                          (983040, 983040, 'EXPECTED_WINDOW'),
+                                         (734000, 256000, 'MIXED_LIMITS'),
                                          (900000, 256000, 'MIXED_LIMITS'),
                                          (128000, 128000, 'OTHER_WINDOW')):
                 for table in ('gen_metadata', 'executor_metadata'):
@@ -149,6 +152,21 @@ class StatusTests(unittest.TestCase):
                 conn.execute('insert into executor_metadata values (0, ?)', (e,))
                 conn.commit()
                 self.assertEqual(f.inspect_context(db_path=path)['state'], state)
+            # Also support live sessions where gen_metadata is populated and executor_metadata is empty.
+            for gen, state in ((734000, 'EXPECTED_WINDOW'), (900000, 'EXPECTED_WINDOW'), (256000, 'LIMITED_256K')):
+                conn.execute('delete from gen_metadata')
+                conn.execute('delete from executor_metadata')
+                g = field(1, field(3, 1419) + field(9, field(10, field(4, gen))) + field(19, b'gemini-4-argon'))
+                conn.execute('insert into gen_metadata values (0, ?)', (g,))
+                conn.commit()
+                ctx = f.inspect_context(db_path=path)
+                self.assertEqual(ctx['state'], state)
+                self.assertEqual(ctx['latest_turn'].get('model_id'), 1419)
+                self.assertEqual(ctx['latest_turn'].get('model_name'), 'gemini-4-argon')
+                self.assertNotIn('executor_idx', ctx['latest_turn'])
+                self.assertNotIn('executor_max_token_limit', ctx['latest_turn'])
+                self.assertNotIn('executor_idx', ctx['first_turn'])
+                self.assertNotIn('executor_max_token_limit', ctx['first_turn'])
             conn.execute('delete from gen_metadata')
             conn.commit()
             self.assertEqual(f.inspect_context(db_path=path)['state'], 'UNKNOWN')

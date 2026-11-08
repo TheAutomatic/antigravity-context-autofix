@@ -9,8 +9,8 @@ Automatic Go pclntab locator and context/rules patcher for Antigravity:
 What it patches (dynamically located via Go 1.20+ pclntab & getter instruction decoding):
 1. applyFeatureProviderCheckpointOverrideConfig -> jumps to a trampoline placed at +0x20 of an unreferenced
    (*CheckpointConfig) setter (SetSessionSummaryPromptOverride first, then any uncalled Set* method)
-2. that setter -> returns at entry; hosts the Argon trampoline
-   Sets max_token_limit = 900000 for Argon High/Medium/Low (1417/1418/1419) while keeping hooks.checkpointNeeded intact for native auto-compaction
+2. that setter -> returns at entry; hosts the universal 1M context trampoline
+   Lifts default 256000 max_token_limit to 734000 (0.70 * 1M, matching Gemini CLI) for all 1M models while keeping hooks.checkpointNeeded and ClampCheckpointConfigForModelInfo intact
 3. readGlobalRules / parseRuleFile / convertSkillPath -> per-file byte limit 24000 -> 1048576 (1 MiB)
 4. computeTruncatedCustomizations -> rules & customizations token budgets 20000 -> 131072 tokens
 """
@@ -65,7 +65,8 @@ HOST_NOOP_ENTRY = {
 DATA_SEGMENT_SKIP = ("__DWARF", "__LINKEDIT", "__eh_frame", ".debug", ".zdebug",
                      ".reloc", ".rela", ".rsrc", ".symtab", ".strtab", ".comment", ".note")
 
-ARGON_MAX_TOKEN_LIMIT = 900000
+DEFAULT_256K_TOKEN_LIMIT = 256000
+ARGON_MAX_TOKEN_LIMIT = 734000  # 0.70 * 1,048,576 (Google Gemini CLI 70% auto-compaction threshold)
 
 
 class BinaryImage:
@@ -539,11 +540,11 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             + bytes([0x48, 0x8B, 0x50, planner_off])         # mov rdx, [rax + planner_off]
             + b"\x48\x85\xd2"                                # test rdx, rdx
             + b"\x74\x15"                                    # je .done (+21 -> 35)
-            + bytes([0x8B, 0x52, plan_model_off])            # mov edx, [rdx + plan_model_off]
-            + b"\x81\xea\x89\x05\x00\x00"                    # sub edx, 1417
-            + b"\x83\xfa\x02"                                # cmp edx, 2
-            + b"\x77\x07"                                    # ja .done (+7 -> 35)
-            + bytes([0xC7, 0x41, max_limit_off])             # mov dword ptr [rcx + max_limit_off], 900000
+            + bytes([0x8B, 0x51, max_limit_off])             # mov edx, [rcx + max_limit_off]
+            + b"\x81\xfa" + struct.pack("<I", DEFAULT_256K_TOKEN_LIMIT)  # cmp edx, 256000
+            + b"\x75\x0a"                                    # jne .done (+10 -> 35)
+            + b"\x0f\x1f\x00"                                # nop dword ptr [rax]
+            + bytes([0xC7, 0x41, max_limit_off])             # mov dword ptr [rcx + max_limit_off], 734000
             + struct.pack("<I", ARGON_MAX_TOKEN_LIMIT)
             + bytes([0x48, 0x89, 0x48, checkpoint_off])      # .done: mov [rax + checkpoint_off], rcx
             + b"\x31\xdb"                                    # xor ebx, ebx
@@ -558,11 +559,11 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             + bytes([0x48, 0x8B, 0x4A, planner_off])         # mov rcx, [rdx + planner_off]
             + b"\x48\x85\xc9"                                # test rcx, rcx
             + b"\x74\x15"                                    # je .done (+21 -> 35)
-            + bytes([0x8B, 0x49, plan_model_off])            # mov ecx, [rcx + plan_model_off]
-            + b"\x81\xe9\x89\x05\x00\x00"                    # sub ecx, 1417
-            + b"\x83\xf9\x02"                                # cmp ecx, 2
-            + b"\x77\x07"                                    # ja .done (+7 -> 35)
-            + bytes([0xC7, 0x40, max_limit_off])             # mov dword ptr [rax + max_limit_off], 900000
+            + bytes([0x8B, 0x48, max_limit_off])             # mov ecx, [rax + max_limit_off]
+            + b"\x81\xf9" + struct.pack("<I", DEFAULT_256K_TOKEN_LIMIT)  # cmp ecx, 256000
+            + b"\x75\x0a"                                    # jne .done (+10 -> 35)
+            + b"\x0f\x1f\x00"                                # nop dword ptr [rax]
+            + bytes([0xC7, 0x40, max_limit_off])             # mov dword ptr [rax + max_limit_off], 734000
             + struct.pack("<I", ARGON_MAX_TOKEN_LIMIT)
             + bytes([0x48, 0x89, 0x42, checkpoint_off])      # .done: mov [rdx + checkpoint_off], rax
             + b"\x31\xdb"                                    # xor ebx, ebx
@@ -649,7 +650,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     changes = [
         {
             "name": "applyOverride_exit",
-            "purpose": "applyFeatureProviderCheckpointOverrideConfig: jump to Argon 900K trampoline",
+            "purpose": "applyFeatureProviderCheckpointOverrideConfig: jump to 734K (0.70*1M) context trampoline",
             "va": hex(exit_va),
             "offset": hex(exit_foff),
             "before": exit_before.hex(),
@@ -667,7 +668,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": f"{f_chk['symbol']}+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit=734000 (0.70*1M) trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -773,12 +774,12 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
         0xB4000140 | checkpoint,                              # cbz checkpoint, .done
         0xF9400000 | ((planner_off // 8) << 10) | (config << 5) | scratch,
         0xB4000100 | scratch,                                 # cbz planner, .done
-        0xB9400000 | ((plan_model_off // 4) << 10) | (scratch << 5) | scratch,
-        0x51162400 | (scratch << 5) | scratch,                 # sub model, model, #1417
-        0x7100081F | (scratch << 5),                           # cmp model, #2
-        0x54000088,                                           # b.hi .done
-        0x52800000 | ((ARGON_MAX_TOKEN_LIMIT & 0xFFFF) << 5) | scratch,          # movz scratch, #0xbba0
-        0x72A00000 | (((ARGON_MAX_TOKEN_LIMIT >> 16) & 0xFFFF) << 5) | scratch,  # movk scratch, #0xd, lsl #16
+        0xB9400000 | ((max_limit_off // 4) << 10) | (checkpoint << 5) | scratch,  # ldr w_scratch, [checkpoint, #max_limit_off]
+        0x5140F800 | (scratch << 5) | scratch,                 # sub w_scratch, w_scratch, #0x3e000 (253952)
+        0x7120001F | (scratch << 5),                           # cmp w_scratch, #0x800 (2048 -> total 256000)
+        0x54000081,                                           # b.ne .done
+        0x52800000 | ((ARGON_MAX_TOKEN_LIMIT & 0xFFFF) << 5) | scratch,          # movz scratch, #0x3330
+        0x72A00000 | (((ARGON_MAX_TOKEN_LIMIT >> 16) & 0xFFFF) << 5) | scratch,  # movk scratch, #0xb, lsl #16 (734000)
         0xB9000000 | ((max_limit_off // 4) << 10) | (checkpoint << 5) | scratch,
         checkpoint_store,                                    # original store
         0x14000000 | ((((exit_va + 4) - (tramp_va + 44)) >> 2) & 0x03FFFFFF),
@@ -816,7 +817,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
     changes = [
         {
             "name": "applyOverride_exit",
-            "purpose": "applyFeatureProviderCheckpointOverrideConfig: branch to Argon 900K trampoline",
+            "purpose": "applyFeatureProviderCheckpointOverrideConfig: branch to 734K (0.70*1M) context trampoline",
             "va": hex(exit_va),
             "offset": hex(exit_foff),
             "before": exit_before.hex(),
@@ -834,7 +835,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": f"{f_chk['symbol']}+0x20: Argon High/Medium/Low (1417..1419) max_token_limit=900000 trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit=734000 (0.70*1M) trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -1461,12 +1462,13 @@ def inspect_context(conversation_id=None, db_path=None):
         recorded_at = database_activity(target_db)
         report = inspect_session(conversation_id=conversation_id, db_path=db_path)
         latest = report["latest_turn"]
-        limits = (latest["gen_max_context_tokens"], latest["executor_max_token_limit"])
-        if limits[0] in (900000, 983040) and limits[1] in (900000, 983040):
+        gen_lim = latest["gen_max_context_tokens"]
+        exec_lim = latest.get("executor_max_token_limit")
+        if gen_lim in (734000, 900000, 983040) and (exec_lim is None or exec_lim in (734000, 900000, 983040)):
             state = "EXPECTED_WINDOW"
-        elif limits == (256000, 256000):
+        elif gen_lim == 256000 and (exec_lim is None or exec_lim == 256000):
             state = "LIMITED_256K"
-        elif limits[0] != limits[1]:
+        elif exec_lim is not None and gen_lim != exec_lim:
             state = "MIXED_LIMITS"
         else:
             state = "OTHER_WINDOW"
@@ -1552,12 +1554,12 @@ def _short_db_label(session: dict) -> str:
     return src
 
 
-def preflight(targets, conversation_id=None, db_path=None):
+def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bool | None = None):
     binaries = []
     for target in targets:
         target = target.expanduser().resolve()
         try:
-            info = analyze_binary(target)
+            info = analyze_binary(target, backup_dir=backup_dir)
             info["compatible"] = info["status"] in ("UNPATCHED", "ALREADY_PATCHED")
             binaries.append(info)
         except Exception as exc:
@@ -1648,7 +1650,7 @@ def preflight(targets, conversation_id=None, db_path=None):
         if "latest_turn" in session:
             lt = session["latest_turn"]
             req_lim = lt["gen_max_context_tokens"]
-            exe_lim = lt["executor_max_token_limit"]
+            exe_lim = lt.get("executor_max_token_limit")
             used = lt.get("gen_used_tokens")
             ago_str = ""
             if session.get("recorded_at"):
@@ -1659,7 +1661,10 @@ def preflight(targets, conversation_id=None, db_path=None):
             cid_short = Path(session["db_path"]).stem[:8]
             proj = session.get("project") or "-"
             time_tag = f"[{ago_str:>3}]" if ago_str else ""
-            meta_str = f"({surface}, turn #{lt['gen_idx']})"
+            m_name = lt.get("model_name")
+            m_id = lt.get("model_id")
+            model_tag = f"{m_name}#{m_id}" if (m_name and m_id) else (m_name or (f"model#{m_id}" if m_id else ""))
+            meta_str = f"({surface}, {model_tag}, turn #{lt['gen_idx']})" if model_tag else f"({surface}, turn #{lt['gen_idx']})"
             print(f"  #{s_idx}  {time_tag} {_style(cid_short, '1', c_on)}  {_style(f'[{proj}]', '1;36', c_on)}  {_style(meta_str, '2', c_on)}  {ctx_badge}")
             if used is not None and req_lim:
                 pct = used / req_lim * 100.0
@@ -1668,7 +1673,8 @@ def preflight(targets, conversation_id=None, db_path=None):
                 bar_color = "32" if pct < 75 else ("33" if pct < 90 else "31")
                 print(f"      Usage : {_style(bar_str, bar_color, c_on)}  {used:,} / {req_lim:,} tokens ({pct:.1f}%)")
             else:
-                print(f"      Limits: Request={req_lim:,}  |  Executor={exe_lim:,}")
+                exe_str = f"{exe_lim:,}" if exe_lim is not None else "-"
+                print(f"      Limits: Request={req_lim:,}  |  Executor={exe_str}")
             if session.get("preview"):
                 print(f"      Topic : {_style(session['preview'], '2', c_on)}")
             if s_idx < len(display_sessions):
@@ -1917,7 +1923,7 @@ def main():
         validate_report_path(args.json_out, targets, args.backup_dir)
     except ValueError as exc:
         ap.error(str(exc))
-    report = preflight(targets, args.conversation_id, args.db)
+    report = preflight(targets, args.conversation_id, args.db, backup_dir=args.backup_dir)
     if args.dry_run:
         if args.json_out:
             write_report(args.json_out, report)

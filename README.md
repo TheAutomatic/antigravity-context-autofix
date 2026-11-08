@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-修复 Antigravity 本地后端的 Argon High / Medium / Low 上下文窗口限制，将请求与自动压缩水位设为 **900000 tokens**（预留安全余量，避免本地字符估算偏低导致冲破云端 1048576 硬上限报 HTTP 400），**完整保留 `hooks.checkpointNeeded` 原生自动摘要压缩（`<CONTEXT_SUMMARY>`）功能**，并调整规则读取预算。同一份 Python 脚本提供自动发现、适配检查、上下文查询、确认后备份修改，以及原版恢复。仅需 **Python 3.9+ 标准库**，不分发专有二进制。
+修复 Antigravity 本地后端的上下文窗口 256K 限制，对**所有原生 1M 模型（Gemini 4 Argon、Gemini 3.8/3.7/3.6 Flash、支持 1M 的 Claude 模型等）通用生效**，参照 Google Gemini CLI 官方 `0.70` 比例标准将自动压缩触发水位设为 **734000 tokens**（`0.70 × 1048576`，既避开 800K~900K 高上下文注意力衰减区，又为单轮突发读取与分词误差留出 **734K → 1048576 硬上限** 超过 31 万 Token 的双限额缓冲带），**完整保留 `hooks.checkpointNeeded` 原生自动摘要压缩（`<CONTEXT_SUMMARY>`）与 `ClampCheckpointConfigForModelInfo` 小模型安全裁剪**，并调整规则读取预算。同一份 Python 脚本提供自动发现、适配检查、上下文查询、确认后备份修改，以及原版恢复。仅需 **Python 3.9+ 标准库**，不分发专有二进制。
 
 ## 预期适用范围
 
@@ -12,7 +12,7 @@
 | Windows | ARM64 / PE | 暂不列入预期范围 | 未验证，不保证适配 |
 | Linux | x86_64 / ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
 | Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
-| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 已实现补丁支持；本机 IDE 2.6.0 / agy 1.4.12 & 1.5.0 的实测结果来自旧版跳板方案，**尚未验证**本次 900000 + 保留原生自动压缩的方案 |
+| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE / CLI (`agy` 1.4.12 & 1.5.0) 已实测修改、签名、启动与新请求窗口 |
 | macOS | x86_64（Intel）或 Universal Mach-O | 暂不支持 | 解析器只支持薄格式 ARM64 Mach-O |
 
 适用与否以本机后端的结构检查结果为准，不能保证所有版本。表中的客户端是预期范围，不代表每种安装布局均已实测。
@@ -87,8 +87,8 @@ python3 scripts/fix_antigravity_context.py --target /路径一/agy --target /路
 
 由于 Antigravity IDE 和 Desktop App 的图形界面目前没有提供 CLI 里的 `/context` 斜杠命令，双击运行 `windows-check-status.cmd` / `macos-check-status.command`（或执行 `./linux-autofix.sh --status`）即可随时查看：
 
-1. **各端最近活跃会话快照**：直接从 `gen_metadata` 解码最后一轮请求的**当前已用 Token 数（`gen_used_tokens`）**与**窗口上限（`gen_max_context_tokens`）**，绘制彩色进度条（`<75%` 绿色、`75%~90%` 黄色、`>=90%` 红色预警）。
-2. **近期活跃 Top 5 对话排行**：按数据库与 `-wal` 预写日志的实时写入时间排序，同时显示**距今活跃时间**（如 `5s ago`）、**会话短 ID**、**Token 进度条**以及从 `transcript.jsonl` 提取的**首句主题摘要**，一眼区分当前正在聊的是哪个窗口。
+1. **各端最近活跃会话快照**：直接从 `gen_metadata` 解码最后一轮请求的**当前已用 Token 数（`gen_used_tokens`）**、**窗口上限（`gen_max_context_tokens`）**以及**使用的模型名称与编号**（如 `gemini-4-argon#1419`、`gemini-3.8-flash#1320`，兼容 `executor_metadata` 为空的实时活跃会话），绘制彩色进度条（`<75%` 绿色、`75%~90%` 黄色、`>=90%` 红色预警）。
+2. **近期活跃 Top 5 对话排行**：按数据库与 `-wal` 预写日志的实时写入时间排序，同时显示**距今活跃时间**（如 `5s ago`）、**会话短 ID**、**项目文件夹名**、**模型名**、**Token 进度条**以及从 `transcript.jsonl` 提取的**首句主题摘要**，一眼区分当前正在聊的是哪个窗口。
 
 默认分别扫描以下两个会话库目录：
 
@@ -103,12 +103,12 @@ python3 scripts/fix_antigravity_context.py --target /路径一/agy --target /路
 | ALREADY_PATCHED / compatible=True | 磁盘已包含补丁，不代表运行中的进程已重启 |
 | UNSUPPORTED_OR_UNRECOGNIZED | 当前脚本无法匹配文件格式、符号或指令 |
 | UNKNOWN_OR_PARTIAL | 不能认定为完整原版或完整补丁，拒绝打补丁；恢复仍可按哈希核验 |
-| LIMITED_256K | 历史请求的 gen / executor 均为 256000 |
-| EXPECTED_WINDOW | gen / executor 均为 900000 或 983040（旧版补丁、重启前的历史记录可能仍是 983040） |
+| LIMITED_256K | 历史请求的窗口为 256000 |
+| EXPECTED_WINDOW | 请求窗口为 734000（或旧版补丁记录的 900000 / 983040） |
 | MIXED_LIMITS / OTHER_WINDOW | 两处不一致或其他窗口，结合模型排查 |
 | UNKNOWN | 数据不足，不能推断锁在256K或已解锁 |
 
-修改后重开 IDE / CLI，用 **Argon High / Medium / Low** 发新请求，再查对应会话：
+修改后重开 IDE / CLI，用任意 1M 模型（如 **Argon**、**3.8 Flash** 或 **Claude**）发新请求，再查对应会话：
 
 ```bash
 python3 scripts/fix_antigravity_context.py --status --conversation-id <会话UUID>
@@ -123,10 +123,12 @@ python3 scripts/verify_session.py --db /实际路径/session.db
 
 ## 修改内容与 Mac 签名
 
-- Argon High / Medium / Low（当前编号1417/1418/1419）最终配置出口写入 `max_token_limit=900000`（请求与自动压缩窗口 **900000**，为本地估算与云端分词器误差预留余量，防止超过服务端 1048576 上限报 400）。
+- **全模型通用解锁（`max_token_limit=734000`）**：在 `applyFeatureProviderCheckpointOverrideConfig` 最终配置出口处，只要检测到 `checkpoint.max_token_limit` 被默认封顶在 `256000`，即统一提升为 **`734000`**（对标 Google Gemini CLI 官方 `0.70 × 1048576` 自动压缩阈值）。不仅对 Argon High / Medium / Low（1417/1418/1419）生效，对 **Gemini 3.8/3.7/3.6 Flash（1318~1320 等）及支持 1M 的 Claude 模型全部通用生效**；同时真实窗口小于 256K 的小模型不会等于 `256000`，且后续完整保留官方 `ClampCheckpointConfigForModelInfo` 按模型自身 `max_tokens` 兜底裁剪，绝不撑爆小模型。
+- **双限额机制（734K 自动压缩 + 1M 硬上限缓冲）**：日常对话达到 **734K** 时由 `hooks.checkpointNeeded` 及时触发 `<CONTEXT_SUMMARY>` 原生总结回落至 ~2 万 Token（避免 800K~900K 注意力稀释降智），而 **734K → 1048576** 之间的 31.4 万 Token 作为单轮突发大文件读取与本地分词误差的安全缓冲带，不再触发云端 HTTP 400。
 - **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为在 `(*CheckpointConfig)` 的一组候选宿主中挑选：优先 `SetSessionSummaryPromptOverride`，该符号被链接器裁掉时改用其余 `(*CheckpointConfig).*` 方法中**没有外部进入**（同时检查 CALL/JMP 与 B/BL/B.cond/CBZ，函数内部自跳转不算）、**地址没有被存进任何非调试段**（可执行段内的常量/指针也计入，仅排除 `__DWARF` / `.debug` 等调试段，因为那里记录的是每个函数的绝对地址）、长度足够的一个；实际宿主写入清单。
 - 规则 / skill 单文件读取上限从24000字节提高到 **1 MiB**。
-- Rules / Customizations 总预算从20000各提高到 **131072 tokens**。规则预算的修改不限于三档窗口选择条件。
+- Rules / Customizations 总预算从20000各提高到 **131072 tokens**。
+- 若目标二进制已打过旧版补丁（如 900K / 983K），且备份目录存在经 SHA256 校验的原版备份，脚本会自动基于原版备份无缝升级到最新补丁。
 - 若当前 Python（如 Microsoft Store 版）在目标目录拒绝 `os.replace`（WinError 6），先重试，再改为带校验的回滚式原地写入；没有可回滚的已验证字节时直接报错，绝不截断目标文件。
 
 代码补丁保持长度；Mac 签名可能改变最终大小。使用系统 `codesign --force --sign -` 做本地 ad-hoc 签名，无需证书；签名和补丁校验通过才替换。不保留原厂开发者身份/公证信任，不关闭 Gatekeeper 或 SIP。
@@ -172,7 +174,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 
 ## 验证与测试
 
-实机验证范围见开头表格：Windows 本机（`agy.exe` 1.4.12 / 1.5.0 与 `language_server.exe`）已完成 900000 窗口修改、启动、单会话超 1000 轮连续 4 次在 80 万~90 万 Token 自动触发 `<CONTEXT_SUMMARY>` 压缩回落至 ~2 万 Token及实时进度条查询验证。macOS 端（IDE 2.6.0 / agy 1.4.12 & 1.5.0 ARM64）此前已验证旧版 983040 跳板方案的签名与启动，新版 900000 + 保留原生自动压缩方案已通过架构单测，待 Mac 实机复核。
+实机验证范围见开头表格：Windows 本机（`agy.exe` 1.4.12 / 1.5.0 与 `language_server.exe`）与 macOS 本机（`agy` 1.4.12 / 1.5.0 ARM64）均已完成补丁修改、签名、启动、单会话超 1000 轮连续多次自动触发 `<CONTEXT_SUMMARY>` 压缩回落至 ~2 万 Token 及实时进度条查询验证。
 
 ```bash
 python3 -m unittest discover -s scripts -v
