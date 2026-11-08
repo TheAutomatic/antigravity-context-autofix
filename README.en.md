@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-Patch the local Antigravity backend to lift the default 256K context cap across **all 1M models (Gemini 4 Argon, Gemini 3.8/3.7/3.6 Flash, 1M-capable Claude models, etc.)**, setting the auto-compaction trigger to **734000 tokens** (`0.70 × 1048576`, matching the official Google Gemini CLI `0.70` threshold — avoiding 800K–900K long-context attention degradation while leaving **>314K tokens of headroom below the 1048576 hard limit** for single-turn bursts and tokenizer variance), **preserving native `hooks.checkpointNeeded` automatic `<CONTEXT_SUMMARY>` compaction and `ClampCheckpointConfigForModelInfo` small-model safety clamping**, and raising rule budgets. One Python script provides discovery, compatibility checks, recorded-context inspection, backup and patching after confirmation, and original-byte restoration. **Python 3.9+ standard library only.** No proprietary binaries are distributed.
+Patch the local Antigravity backend to lift the default 256K context cap for supported 1M models, preserving native automatic compaction and model safety clamping. The interactive menu defaults to **1: 512000 tokens (512K)**; choose **2: 734000 tokens (734K)**, or pass **--context-limit TOKENS** for a custom budget. The script also raises rule budgets, discovers installations, checks compatibility, backs up and patches after confirmation, and restores original bytes. **Python 3.9+ standard library only.** No proprietary binaries are distributed.
 
 ## Expected compatibility
 
@@ -48,13 +48,27 @@ python3 scripts/fix_antigravity_context.py
 python3 scripts/fix_antigravity_context.py --restore
 ```
 
+## Compaction budget
+
+```bash
+# Default menu: Enter / 1 = 512000; 2 = 734000
+python3 scripts/fix_antigravity_context.py
+# Skip the budget menu; review targets and confirm Y
+python3 scripts/fix_antigravity_context.py --context-limit 734000
+python3 scripts/fix_antigravity_context.py --context-limit 600000
+# Verify a custom budget after restarting and sending a new request
+python3 scripts/verify_session.py --db /path/session.db --expected-limit 600000
+```
+
+K here means 1000 tokens: 512K is 512000, not 524288. Command-line values are integer token counts. All OS launchers forward arguments, for example ./linux-autofix.sh --context-limit 600000. Switching an existing patch to another budget requires a verified original backup; the script rebuilds from that backup. A plain --status detects the installed budget without prompting. A custom session budget outside the built-in presets is shown as OTHER_WINDOW; verify it with --expected-limit. --context-limit cannot be combined with --restore.
+
 ## Workflow
 
 1. Discover current-user default locations, PATH and known application directories. Resolve symlinks and deduplicate real paths.
 2. Report each backend's format, architecture, SHA256, patch state, selected trampoline host symbol, and compatibility.
 3. Report the most recently active database separately for IDE/App and CLI (considering both the main file and `-wal` mtime), showing a **live token usage progress bar (`Used / Limit tokens` and percentage)**, time since last activity, and first-prompt topic preview, followed by the **Top 5 Recent Active Conversations** leaderboard. No model launch or request is sent.
 4. In patch mode, stop before changes if any selected backend is incompatible or partially patched. Use repeated `--target PATH` options to select a supported subset. Restore independently verifies current-file and backup hashes without requiring patch-parser compatibility.
-5. List actual action paths and backup directory. Only explicit Y at `Continue? [y/N]` proceeds. Enter, other input and EOF cancel. If all files are patched already, exit without changes.
+5. In patch mode, choose the compaction budget first: Enter / 1 = 512000, 2 = 734000. An explicit --context-limit skips this menu. List actual action paths and backup directory. Only explicit Y at `Continue? [y/N]` proceeds. Enter, other input and EOF cancel. If all files are patched already, exit without changes.
 6. Patch mode then asks how to treat old backups: `1` (default, just press Enter) prunes backups that do not belong to the installed build after a successful patch, keeping only this build's original and manifest; `2` keeps every existing backup. No input or an unrecognised answer keeps them; restore never prunes.
 7. List running backend process names and PIDs. Close the IDE / CLI and type Y to check again; cancel otherwise. Processes are not terminated by default.
 8. Back up and verify original SHA256, patch a temporary file, sign / verify on macOS, and record the final hash. Recheck processes and current file hash before atomic replacement.
@@ -102,7 +116,7 @@ These databases are not mapped to a particular discovered executable. They may b
 | UNSUPPORTED_OR_UNRECOGNIZED | Format, symbols or instructions cannot be matched |
 | UNKNOWN_OR_PARTIAL | Neither recognized original nor complete patch; refuse patching, but hash-verified restoration remains available |
 | LIMITED_256K | Recorded request limit is 256000 |
-| EXPECTED_WINDOW | Request limit is 734000 (or 900000 / 983040 from earlier patches) |
+| EXPECTED_WINDOW | Request limit is 512000 / 734000 (or 900000 / 983040 from earlier patches) |
 | MIXED_LIMITS / OTHER_WINDOW | Differing limits or another window; inspect model choice |
 | UNKNOWN | Insufficient evidence |
 
@@ -119,8 +133,8 @@ Acceptance reports `latest_limit_ok: true` when limits match. A stored window do
 
 ## Changes and signing
 
-- **Universal 1M Model Unlock (`max_token_limit=734000`)**: At final config merge (`applyFeatureProviderCheckpointOverrideConfig`), whenever `checkpoint.max_token_limit` is capped at the client's default `256000`, the trampoline lifts it to **`734000`** (`0.70 × 1048576`, matching the official Google Gemini CLI `0.70` auto-compaction threshold). This applies universally across **Gemini 4 Argon (1417–1419), Gemini 3.8/3.7/3.6 Flash (1318–1320, etc.), and 1M-capable Claude models**. Models with a true window smaller than 256K do not match `256000` and are also safely clamped by the subsequent native `ClampCheckpointConfigForModelInfo` call.
-- **Dual-Threshold Headroom (734K Auto-Compaction + 1M Hard Ceiling)**: Normal turns trigger native `<CONTEXT_SUMMARY>` compaction at **734K** via `hooks.checkpointNeeded` (avoiding 800K–900K attention dilution), while the **314K-token buffer between 734K and 1,048,576** absorbs single-turn large file reads and local-vs-server tokenizer variance without HTTP 400 errors.
+- **Selected compaction budget**: At the final config merge, a default checkpoint limit of 256000 is raised to the selected budget: 512000 by default, 734000 for menu option 2, or the explicit --context-limit value. The native hooks.checkpointNeeded compaction and ClampCheckpointConfigForModelInfo model safety clamping remain intact.
+- **Headroom**: For a model with a 1,048,576-token window, the default 512000 budget leaves 536576 tokens of headroom; option 2 leaves 314576 tokens. A custom budget nearer the model limit leaves less room for bursts and tokenizer variance.
 - **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction works seamlessly. The 46/48-byte trampoline goes into one (*CheckpointConfig) method chosen at patch time: `SetSessionSummaryPromptOverride` first, otherwise any other `(*CheckpointConfig).*` method that nothing enters from outside (CALL/JMP and B/BL/B.cond/CBZ are checked; a jump inside the body does not count), whose address is not stored in any non-debug segment (constants and pointers inside executable segments count too; `__DWARF`/`.debug` are ignored because they list every function address), and that is large enough. The chosen symbol is written to the manifest.
 - Raise per-file rule / skill cap from 24000 bytes to **1 MiB**.
 - Raise rules and customizations budgets from 20000 to **131072 tokens** each.
@@ -159,6 +173,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 |---|---|
 | No flags | Discover, inspect, confirm and patch original targets |
 | --status / --check / --dry-run | Inspect only |
+| --context-limit TOKENS | Custom integer compaction budget, 256001–1048576; skips the threshold menu, while Y confirmation remains required |
 | --target PATH | Repeatable explicit targets; replaces discovery |
 | --conversation-id UUID / --db PATH | Choose one precise session |
 | --restore | Verify backups, confirm and restore; --json-out includes before/after hashes and backup source |

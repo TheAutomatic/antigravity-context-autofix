@@ -2,7 +2,7 @@
 
 **[简体中文](README.md) | [English](README.en.md)**
 
-修复 Antigravity 本地后端的上下文窗口 256K 限制，对**所有原生 1M 模型（Gemini 4 Argon、Gemini 3.8/3.7/3.6 Flash、支持 1M 的 Claude 模型等）通用生效**，参照 Google Gemini CLI 官方 `0.70` 比例标准将自动压缩触发水位设为 **734000 tokens**（`0.70 × 1048576`，既避开 800K~900K 高上下文注意力衰减区，又为单轮突发读取与分词误差留出 **734K → 1048576 硬上限** 超过 31 万 Token 的双限额缓冲带），**完整保留 `hooks.checkpointNeeded` 原生自动摘要压缩（`<CONTEXT_SUMMARY>`）与 `ClampCheckpointConfigForModelInfo` 小模型安全裁剪**，并调整规则读取预算。同一份 Python 脚本提供自动发现、适配检查、上下文查询、确认后备份修改，以及原版恢复。仅需 **Python 3.9+ 标准库**，不分发专有二进制。
+修复 Antigravity 本地后端的上下文窗口 256K 限制，适用于支持的原生 1M 模型，保留原生自动摘要压缩与模型安全裁剪。交互菜单默认 **1：512000 tokens（512K）压缩**，输入 **2：734000 tokens（734K）压缩**，也可用 **--context-limit TOKENS** 自定义阈值。脚本同时调整规则读取预算，提供自动发现、适配检查、上下文查询、确认后备份修改及原版恢复。仅需 **Python 3.9+ 标准库**，不分发专有二进制。
 
 ## 预期适用范围
 
@@ -50,13 +50,27 @@ python3 scripts/fix_antigravity_context.py
 python3 scripts/fix_antigravity_context.py --restore
 ```
 
+## 选择压缩阈值
+
+```bash
+# 交互菜单：回车 / 1 = 512000；2 = 734000
+python3 scripts/fix_antigravity_context.py
+# 跳过阈值菜单，核对目标后仍需输入 Y
+python3 scripts/fix_antigravity_context.py --context-limit 734000
+python3 scripts/fix_antigravity_context.py --context-limit 600000
+# 重启并发送新请求后，验收自定义阈值
+python3 scripts/verify_session.py --db /实际路径/session.db --expected-limit 600000
+```
+
+这里 K 按 1000 tokens 计，512K 为 512000，不是 524288；参数接收整数 token 数。所有系统的快捷入口均转发参数，例如 ./linux-autofix.sh --context-limit 600000。已有补丁切换阈值时，需要存在经过校验的原版备份，脚本会基于该备份重新生成补丁。直接 --status 会自动识别已安装阈值，不弹出菜单。非内置预设的自定义会话阈值显示为 OTHER_WINDOW，可用 --expected-limit 精确验收。--context-limit 不能与 --restore 混用。
+
 ## 执行流程
 
 1. 发现当前用户默认位置、PATH 和已知应用目录的后端，解析符号链接并按真实路径去重。
 2. 逐个显示路径、格式、架构、SHA256、补丁状态、跳板宿主函数及是否兼容。
 3. 分别查询 IDE/App 与 CLI 各自最近活跃的数据库（同时考虑主文件和 -wal 修改时间），显示**实时已用 Token 进度条（`Used / Limit tokens` 与百分比）**、最后活跃时间与首句主题摘要，并列出**近期活跃 Top 5 对话的上下文排行**（代替 IDE / App 中缺失的 `/context` 面板）。不启动模型、不发送请求。
 4. 修改模式下，存在不兼容或部分修改的目标时停止，不修改任何目标；可用 `--target` 只选择确认过的目标。恢复模式独立核验当前文件与备份哈希，不要求通过补丁适配检查。
-5. 列出实际待修改或恢复的路径与备份目录，询问 `Continue? [y/N]`。只有明确输入 Y 才继续；回车、其他输入或无交互输入均取消。全部已修补则报告无需修改。
+5. 修改模式先选择压缩阈值：回车 / 1 为 512000，2 为 734000；显式传入 --context-limit 时跳过此菜单。列出实际待修改或恢复的路径与备份目录，询问 `Continue? [y/N]`。只有明确输入 Y 才继续；回车、其他输入或无交互输入均取消。全部已修补则报告无需修改。
 6. 修改模式再询问老版本备份如何处理：`1`（默认，回车即可）打完补丁后清理不属于当前构建的备份，只保留当前版本的原版与清单；`2` 保留全部已有备份。无输入或无法识别的回答按保留处理（恢复模式不清理）。
 7. 检查同名后端进程，显示名称和 PID。关闭 IDE / CLI 后输入 Y 重查，仍占用则继续提示，其他输入取消。默认不杀进程。
 8. 备份原版并核验 SHA256，在临时文件上应用补丁；Mac 自动签名并校验，记录签名后的最终哈希。替换前再次检查进程和目标哈希，避免自动升级造成误写。
@@ -104,7 +118,7 @@ python3 scripts/fix_antigravity_context.py --target /路径一/agy --target /路
 | UNSUPPORTED_OR_UNRECOGNIZED | 当前脚本无法匹配文件格式、符号或指令 |
 | UNKNOWN_OR_PARTIAL | 不能认定为完整原版或完整补丁，拒绝打补丁；恢复仍可按哈希核验 |
 | LIMITED_256K | 历史请求的窗口为 256000 |
-| EXPECTED_WINDOW | 请求窗口为 734000（或旧版补丁记录的 900000 / 983040） |
+| EXPECTED_WINDOW | 请求窗口为 512000 / 734000（或旧版补丁记录的 900000 / 983040） |
 | MIXED_LIMITS / OTHER_WINDOW | 两处不一致或其他窗口，结合模型排查 |
 | UNKNOWN | 数据不足，不能推断锁在256K或已解锁 |
 
@@ -123,8 +137,8 @@ python3 scripts/verify_session.py --db /实际路径/session.db
 
 ## 修改内容与 Mac 签名
 
-- **全模型通用解锁（`max_token_limit=734000`）**：在 `applyFeatureProviderCheckpointOverrideConfig` 最终配置出口处，只要检测到 `checkpoint.max_token_limit` 被默认封顶在 `256000`，即统一提升为 **`734000`**（对标 Google Gemini CLI 官方 `0.70 × 1048576` 自动压缩阈值）。不仅对 Argon High / Medium / Low（1417/1418/1419）生效，对 **Gemini 3.8/3.7/3.6 Flash（1318~1320 等）及支持 1M 的 Claude 模型全部通用生效**；同时真实窗口小于 256K 的小模型不会等于 `256000`，且后续完整保留官方 `ClampCheckpointConfigForModelInfo` 按模型自身 `max_tokens` 兜底裁剪，绝不撑爆小模型。
-- **双限额机制（734K 自动压缩 + 1M 硬上限缓冲）**：日常对话达到 **734K** 时由 `hooks.checkpointNeeded` 及时触发 `<CONTEXT_SUMMARY>` 原生总结回落至 ~2 万 Token（避免 800K~900K 注意力稀释降智），而 **734K → 1048576** 之间的 31.4 万 Token 作为单轮突发大文件读取与本地分词误差的安全缓冲带，不再触发云端 HTTP 400。
+- **可选压缩阈值**：在最终配置出口处，将默认的 checkpoint.max_token_limit=256000 提升到所选阈值：默认 512000、菜单选项 2 为 734000，或 --context-limit 指定的数值。保留 hooks.checkpointNeeded 原生压缩与 ClampCheckpointConfigForModelInfo 模型安全裁剪。
+- **窗口缓冲**：对于 1048576-token 窗口的模型，默认 512000 阈值留出 536576 tokens，选项 2 留出 314576 tokens。自定义阈值越接近模型上限，留给单轮突发读取与分词误差的空间越少。
 - **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为在 `(*CheckpointConfig)` 的一组候选宿主中挑选：优先 `SetSessionSummaryPromptOverride`，该符号被链接器裁掉时改用其余 `(*CheckpointConfig).*` 方法中**没有外部进入**（同时检查 CALL/JMP 与 B/BL/B.cond/CBZ，函数内部自跳转不算）、**地址没有被存进任何非调试段**（可执行段内的常量/指针也计入，仅排除 `__DWARF` / `.debug` 等调试段，因为那里记录的是每个函数的绝对地址）、长度足够的一个；实际宿主写入清单。
 - 规则 / skill 单文件读取上限从24000字节提高到 **1 MiB**。
 - Rules / Customizations 总预算从20000各提高到 **131072 tokens**。
@@ -163,6 +177,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 |---|---|
 | 无参数 | 自动发现、检查，确认后修改未修补目标 |
 | --status / --check / --dry-run | 只检查 |
+| --context-limit TOKENS | 自定义整数压缩阈值，范围 256001–1048576；跳过阈值菜单，仍需输入 Y 确认修改 |
 | --target PATH | 指定目标，支持重复，替代自动发现 |
 | --conversation-id UUID / --db PATH | 二选一，指定查询会话 |
 | --restore | 核验备份、确认并恢复；与 --json-out 一起使用可输出恢复前后哈希和备份来源 |

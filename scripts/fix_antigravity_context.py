@@ -10,7 +10,7 @@ What it patches (dynamically located via Go 1.20+ pclntab & getter instruction d
 1. applyFeatureProviderCheckpointOverrideConfig -> jumps to a trampoline placed at +0x20 of an unreferenced
    (*CheckpointConfig) setter (SetSessionSummaryPromptOverride first, then any uncalled Set* method)
 2. that setter -> returns at entry; hosts the universal 1M context trampoline
-   Lifts default 256000 max_token_limit to 734000 (0.70 * 1M, matching Gemini CLI) for all 1M models while keeping hooks.checkpointNeeded and ClampCheckpointConfigForModelInfo intact
+   Lifts default 256000 max_token_limit to a selected budget (512000 by default) for all 1M models while keeping hooks.checkpointNeeded and ClampCheckpointConfigForModelInfo intact
 3. readGlobalRules / parseRuleFile / convertSkillPath -> per-file byte limit 24000 -> 1048576 (1 MiB)
 4. computeTruncatedCustomizations -> rules & customizations token budgets 20000 -> 131072 tokens
 """
@@ -72,7 +72,9 @@ DATA_SEGMENT_SKIP = ("__DWARF", "__LINKEDIT", "__eh_frame", ".debug", ".zdebug",
                      ".reloc", ".rela", ".rsrc", ".symtab", ".strtab", ".comment", ".note")
 
 DEFAULT_256K_TOKEN_LIMIT = 256000
-ARGON_MAX_TOKEN_LIMIT = 734000  # 0.70 * 1,048,576 (Google Gemini CLI 70% auto-compaction threshold)
+DEFAULT_CONTEXT_LIMIT = 512000
+HIGH_CONTEXT_LIMIT = 734000
+MAX_CONTEXT_LIMIT = 1048576
 
 
 class BinaryImage:
@@ -484,7 +486,7 @@ def choose_trampoline_host(img: BinaryImage, funcs: dict, hosts: dict, go_text_v
         + ("; ".join(rejected[:4]) or "none present") + ")")
 
 
-def build_x86_64_plan(img: BinaryImage, funcs: dict):
+def build_x86_64_plan(img: BinaryImage, funcs: dict, context_limit=DEFAULT_CONTEXT_LIMIT):
     data = img.data
 
     def fbytes(k):
@@ -572,8 +574,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             + b"\x81\xfa" + struct.pack("<I", DEFAULT_256K_TOKEN_LIMIT)  # cmp edx, 256000
             + b"\x75\x0a"                                    # jne .done (+10 -> 35)
             + b"\x0f\x1f\x00"                                # nop dword ptr [rax]
-            + bytes([0xC7, 0x41, max_limit_off])             # mov dword ptr [rcx + max_limit_off], 734000
-            + struct.pack("<I", ARGON_MAX_TOKEN_LIMIT)
+            + bytes([0xC7, 0x41, max_limit_off])             # mov selected budget
+            + struct.pack("<I", context_limit)
             + bytes([0x48, 0x89, 0x48, checkpoint_off])      # .done: mov [rax + checkpoint_off], rcx
             + b"\x31\xdb"                                    # xor ebx, ebx
             + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6)
@@ -591,8 +593,8 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
             + b"\x81\xf9" + struct.pack("<I", DEFAULT_256K_TOKEN_LIMIT)  # cmp ecx, 256000
             + b"\x75\x0a"                                    # jne .done (+10 -> 35)
             + b"\x0f\x1f\x00"                                # nop dword ptr [rax]
-            + bytes([0xC7, 0x40, max_limit_off])             # mov dword ptr [rax + max_limit_off], 734000
-            + struct.pack("<I", ARGON_MAX_TOKEN_LIMIT)
+            + bytes([0xC7, 0x40, max_limit_off])             # mov selected budget
+            + struct.pack("<I", context_limit)
             + bytes([0x48, 0x89, 0x42, checkpoint_off])      # .done: mov [rdx + checkpoint_off], rax
             + b"\x31\xdb"                                    # xor ebx, ebx
             + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6 -> mov rax, rdx)
@@ -678,7 +680,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     changes = [
         {
             "name": "applyOverride_exit",
-            "purpose": "applyFeatureProviderCheckpointOverrideConfig: jump to 734K (0.70*1M) context trampoline",
+            "purpose": f"applyFeatureProviderCheckpointOverrideConfig: jump to {context_limit} token context trampoline",
             "va": hex(exit_va),
             "offset": hex(exit_foff),
             "before": exit_before.hex(),
@@ -696,7 +698,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit=734000 (0.70*1M) trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit={context_limit} trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -735,7 +737,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict):
     }
 
 
-def build_arm64_plan(img: BinaryImage, funcs: dict):
+def build_arm64_plan(img: BinaryImage, funcs: dict, context_limit=DEFAULT_CONTEXT_LIMIT):
     data = img.data
 
     def fbytes(k):
@@ -806,8 +808,8 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
         0x5140F800 | (scratch << 5) | scratch,                 # sub w_scratch, w_scratch, #0x3e000 (253952)
         0x7120001F | (scratch << 5),                           # cmp w_scratch, #0x800 (2048 -> total 256000)
         0x54000081,                                           # b.ne .done
-        0x52800000 | ((ARGON_MAX_TOKEN_LIMIT & 0xFFFF) << 5) | scratch,          # movz scratch, #0x3330
-        0x72A00000 | (((ARGON_MAX_TOKEN_LIMIT >> 16) & 0xFFFF) << 5) | scratch,  # movk scratch, #0xb, lsl #16 (734000)
+        0x52800000 | ((context_limit & 0xFFFF) << 5) | scratch,          # movz scratch, low 16 bits
+        0x72A00000 | (((context_limit >> 16) & 0xFFFF) << 5) | scratch,  # movk scratch, high 16 bits
         0xB9000000 | ((max_limit_off // 4) << 10) | (checkpoint << 5) | scratch,
         checkpoint_store,                                    # original store
         0x14000000 | ((((exit_va + 4) - (tramp_va + 44)) >> 2) & 0x03FFFFFF),
@@ -845,7 +847,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
     changes = [
         {
             "name": "applyOverride_exit",
-            "purpose": "applyFeatureProviderCheckpointOverrideConfig: branch to 734K (0.70*1M) context trampoline",
+            "purpose": f"applyFeatureProviderCheckpointOverrideConfig: branch to {context_limit} token context trampoline",
             "va": hex(exit_va),
             "offset": hex(exit_foff),
             "before": exit_before.hex(),
@@ -863,7 +865,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict):
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit=734000 (0.70*1M) trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit={context_limit} trampoline",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -974,7 +976,7 @@ def valid_checkpoint_entry(img, function):
     return False
 
 
-def _try_upgrade_from_verified_backup(target: Path, sha256: str, backup_dir: Path | bool | None):
+def _try_upgrade_from_verified_backup(target: Path, sha256: str, backup_dir: Path | bool | None, context_limit=None):
     if backup_dir is False:
         return None
     bdir = backup_dir if isinstance(backup_dir, Path) else (Path.home() / ".gemini" / "agy-patches")
@@ -983,7 +985,7 @@ def _try_upgrade_from_verified_backup(target: Path, sha256: str, backup_dir: Pat
     try:
         _, mdata, bak = select_restore_backup(target, bdir, sha256)
         if sha256 == mdata.get("patched_sha256") and bak.resolve() != target.resolve():
-            bak_info = analyze_binary(bak, backup_dir=False)
+            bak_info = analyze_binary(bak, backup_dir=False, context_limit=context_limit)
             if bak_info["status"] == "UNPATCHED":
                 bak_info["path"] = str(target)
                 bak_info["target_disk_sha256"] = sha256
@@ -1015,7 +1017,7 @@ def recorded_hash_role(target: Path, sha256: str, backup_dir):
     return None
 
 
-def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
+def analyze_binary(target: Path, backup_dir: Path | bool | None = None, context_limit=None):
     data = target.read_bytes()
     sha256 = hashlib.sha256(data).hexdigest()
     img = BinaryImage(data)
@@ -1023,9 +1025,25 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
     try:
         host, host_ambiguous = choose_trampoline_host(img, funcs, hosts, go_text_va)
         funcs = dict(funcs, trampolineHost=host)
-        plan = build_x86_64_plan(img, funcs) if img.arch == "x86_64" else build_arm64_plan(img, funcs)
+        selected_limit = context_limit or DEFAULT_CONTEXT_LIMIT
+        # Read-only analysis recognises any complete patch generated with a valid
+        # threshold. The complete plan below still validates every patched byte.
+        if context_limit is None:
+            start = host["file_start"]
+            noop = HOST_NOOP_ENTRY[img.arch]
+            if data[start:start + len(noop)] == noop:
+                trampoline = start + 0x20
+                if img.arch == "x86_64":
+                    candidate = struct.unpack_from("<I", data, trampoline + 31)[0]
+                else:
+                    low, high = struct.unpack_from("<II", data, trampoline + 28)
+                    candidate = ((low >> 5) & 0xFFFF) | (((high >> 5) & 0xFFFF) << 16)
+                if DEFAULT_256K_TOKEN_LIMIT < candidate <= MAX_CONTEXT_LIMIT:
+                    selected_limit = candidate
+        plan = (build_x86_64_plan(img, funcs, selected_limit) if img.arch == "x86_64"
+                else build_arm64_plan(img, funcs, selected_limit))
     except RuntimeError:
-        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir)
+        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir, context_limit)
         if upgraded is not None:
             return upgraded
         raise
@@ -1074,7 +1092,7 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
         status = "UNKNOWN_OR_PARTIAL"
 
     if status == "UNKNOWN_OR_PARTIAL":
-        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir)
+        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir, context_limit)
         if upgraded is not None:
             return upgraded
     return {
@@ -1086,6 +1104,7 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None):
         "pclntab_offset": hex(pcln_off),
         "go_text_va": hex(go_text_va),
         "status": status,
+        "context_limit": selected_limit,
         "host_entry": "unverified" if host_ambiguous else "recognised",
         "backup_scope": "Pre-patch bytes; instruction validation is not vendor authenticity verification.",
         "field_offsets": plan["field_offsets"],
@@ -1176,8 +1195,8 @@ def discover_default_targets() -> list[Path]:
     return unique_targets(c for c in candidates if c.is_file())
 
 
-def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
-    info = analyze_binary(target, backup_dir=backup_dir)
+def patch_target(target: Path, backup_dir: Path, dry_run: bool = False, context_limit=DEFAULT_CONTEXT_LIMIT):
+    info = analyze_binary(target, backup_dir=backup_dir, context_limit=context_limit)
     print(f"\nTarget : {info['path']}")
     print(f"Format : {info['format']} {info['arch']} ({info['size']} bytes)")
     print(f"SHA256 : {info['sha256']}")
@@ -1272,6 +1291,10 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False):
         patched_sha256 = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
         info["patched_sha256"] = patched_sha256
         info["patched_size"] = tmp_path.stat().st_size
+        # Keep the installed patch's restore record until replacement succeeds,
+        # including across crashes or a failure syncing the new manifest.
+        manifest_file = manifest_file.with_name(
+            f"{manifest_file.stem}-{patched_sha256[:16]}.json")
         # Persist the record that identifies the new hash before the binary can
         # land, so a successful replacement always has a restore entry; drop it
         # again only when the target on disk is confirmed untouched/rolled back.
@@ -1504,7 +1527,7 @@ def replace_with_retry(source, target, expected_sha256, rollback_bytes=None):
 
 def inspect_context(conversation_id=None, db_path=None):
     """Read historical request metadata; absence or parse failure is never 'locked'."""
-    from verify_session import inspect_session, database_activity, find_conversation_db
+    from verify_session import inspect_session, database_activity, find_conversation_db, ACCEPTED_LIMITS
     try:
         target_db = db_path.expanduser().resolve() if db_path else find_conversation_db(conversation_id)
         recorded_at = database_activity(target_db)
@@ -1512,7 +1535,7 @@ def inspect_context(conversation_id=None, db_path=None):
         latest = report["latest_turn"]
         gen_lim = latest["gen_max_context_tokens"]
         exec_lim = latest.get("executor_max_token_limit")
-        if gen_lim in (734000, 900000, 983040) and (exec_lim is None or exec_lim in (734000, 900000, 983040)):
+        if gen_lim in ACCEPTED_LIMITS and (exec_lim is None or exec_lim in ACCEPTED_LIMITS):
             state = "EXPECTED_WINDOW"
         elif gen_lim == 256000 and (exec_lim is None or exec_lim == 256000):
             state = "LIMITED_256K"
@@ -1602,12 +1625,12 @@ def _short_db_label(session: dict) -> str:
     return src
 
 
-def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bool | None = None):
+def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bool | None = None, context_limit=None):
     binaries = []
     for target in targets:
         target = target.expanduser().resolve()
         try:
-            info = analyze_binary(target, backup_dir=backup_dir)
+            info = analyze_binary(target, backup_dir=backup_dir, context_limit=context_limit)
             info["compatible"] = info["status"] in ("UNPATCHED", "ALREADY_PATCHED")
             binaries.append(info)
         except Exception as exc:
@@ -1655,6 +1678,7 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
             host = info["functions"]["trampolineHost"]["symbol"].rsplit(".", 1)[-1]
             note = "  [入口未识别 / entry not recognised]" if info.get("host_entry") == "unverified" else ""
             print(f"      Host   : {host}{note}")
+            print(f"      Budget : {info.get('context_limit', DEFAULT_CONTEXT_LIMIT):,} tokens")
         if idx < len(binaries):
             print()
 
@@ -1824,6 +1848,32 @@ def confirm_actions(targets, backup_dir, restore=False):
         raise SystemExit("Cancelled. No files modified.")
 
 
+def parse_context_limit(value):
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("Context limit must be an integer token count")
+    if not DEFAULT_256K_TOKEN_LIMIT < limit <= MAX_CONTEXT_LIMIT:
+        raise argparse.ArgumentTypeError("Context limit must be between 256001 and 1048576 tokens")
+    return limit
+
+
+def choose_context_limit():
+    print("\n自动压缩阈值 / Auto-compaction threshold:")
+    print("  1) 512K — 512000 tokens（默认 / default）")
+    print("  2) 734K — 734000 tokens")
+    while True:
+        try:
+            answer = input("选择 / Choose [1/2] (Enter = 1): ").strip()
+        except EOFError:
+            raise SystemExit("Cancelled: no interactive input available.")
+        if answer in ("", "1"):
+            return DEFAULT_CONTEXT_LIMIT
+        if answer == "2":
+            return HIGH_CONTEXT_LIMIT
+        print("请输入 1 或 2 / Enter 1 or 2.")
+
+
 def confirm_backup_retention() -> bool:
     """True to prune backups of builds that are no longer installed (default)."""
     print("\n老版本备份 / Old-version backups:")
@@ -1977,10 +2027,13 @@ def main():
     ap.add_argument("--kill", action="store_true", help="Terminate running agy.exe / language_server.exe processes before patching.")
     ap.add_argument("--backup-dir", type=Path, default=Path.home() / ".gemini" / "agy-patches", help="Directory to store original backups and manifests.")
     ap.add_argument("--json-out", type=Path, help="Optional path to write full analysis/patch report as JSON.")
+    ap.add_argument("--context-limit", type=parse_context_limit, help="Auto-compaction token budget (256001..1048576); skips the 512K/734K menu. Default menu choice: 512000.")
     args = ap.parse_args()
     args.dry_run = args.dry_run or args.status
     if args.restore and args.dry_run:
         ap.error("--restore cannot be combined with --check/--dry-run")
+    if args.restore and args.context_limit is not None:
+        ap.error("--context-limit cannot be combined with --restore")
     if args.db and args.conversation_id:
         ap.error("Choose --db or --conversation-id, not both")
 
@@ -1990,7 +2043,13 @@ def main():
         validate_report_path(args.json_out, targets, args.backup_dir)
     except ValueError as exc:
         ap.error(str(exc))
-    report = preflight(targets, args.conversation_id, args.db, backup_dir=args.backup_dir)
+    context_limit = args.context_limit
+    if not args.dry_run and not args.restore and targets and context_limit is None:
+        context_limit = choose_context_limit()
+    if context_limit is not None:
+        print(f"Auto-compaction threshold: {context_limit:,} tokens")
+    report = preflight(targets, args.conversation_id, args.db, backup_dir=args.backup_dir,
+                       context_limit=context_limit)
     if args.dry_run:
         if args.json_out:
             write_report(args.json_out, report)
@@ -2023,7 +2082,7 @@ def main():
         if args.restore:
             results.append(restore_target(t, args.backup_dir))
         else:
-            res = patch_target(t, args.backup_dir, dry_run=args.dry_run)
+            res = patch_target(t, args.backup_dir, dry_run=args.dry_run, context_limit=context_limit)
             results.append(res)
 
     if prune_old:

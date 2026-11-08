@@ -30,14 +30,14 @@ class StatusTests(unittest.TestCase):
         target = Path('agy').resolve()
         report = {'compatible': True, 'binaries': [{'path': str(target), 'status': 'UNPATCHED'}]}
         for answer in ('', 'n'):
-            with patch('sys.argv', ['fix', '--target', str(target), '--kill']), \
+            with patch('sys.argv', ['fix', '--target', str(target), '--kill', '--context-limit', '512000']), \
                  patch.object(f, 'preflight', return_value=report), patch('builtins.input', return_value=answer), \
                  patch.object(f, 'kill_running_backends') as kill, patch.object(f, 'patch_target') as modify, \
                  self.assertRaises(SystemExit):
                 f.main()
             kill.assert_not_called()
             modify.assert_not_called()
-        with patch('sys.argv', ['fix', '--target', str(target)]), \
+        with patch('sys.argv', ['fix', '--target', str(target), '--context-limit', '512000']), \
              patch.object(f, 'preflight', return_value=report), patch('builtins.input', return_value='Y'), \
              patch.object(f, 'wait_for_backends'), patch.object(f, 'patch_target') as modify, \
              patch.object(Path, 'exists', return_value=True):
@@ -48,7 +48,7 @@ class StatusTests(unittest.TestCase):
         target = Path('agy').resolve()
         report = {'compatible': True, 'binaries': [{'path': str(target), 'status': 'UNPATCHED'}]}
         for answer, expected in (('', True), ('2', False)):
-            with patch('sys.argv', ['fix', '--target', str(target)]), \
+            with patch('sys.argv', ['fix', '--target', str(target), '--context-limit', '512000']), \
                  patch.object(f, 'preflight', return_value=report), \
                  patch('builtins.input', side_effect=['Y', answer]), \
                  patch.object(f, 'wait_for_backends'), \
@@ -63,7 +63,7 @@ class StatusTests(unittest.TestCase):
         target = Path('agy').resolve()
         report = {'compatible': True, 'binaries': [{'path': str(target), 'status': 'ALREADY_PATCHED'}]}
         for flags in ([], ['--status']):
-            with patch('sys.argv', ['fix', '--target', str(target)] + flags), \
+            with patch('sys.argv', ['fix', '--target', str(target), '--context-limit', '512000'] + flags), \
                  patch.object(f, 'preflight', return_value=report), patch('builtins.input') as prompt, \
                  patch.object(f, 'patch_target') as modify:
                 try:
@@ -83,7 +83,7 @@ class StatusTests(unittest.TestCase):
              self.assertRaises(SystemExit):
             f.main()
         restore.assert_not_called()
-        with patch('sys.argv', ['fix', '--target', str(target)]), \
+        with patch('sys.argv', ['fix', '--target', str(target), '--context-limit', '512000']), \
              patch.object(f, 'preflight', return_value={'compatible': False}), \
              patch('builtins.input') as prompt, patch.object(f, 'patch_target') as modify, \
              self.assertRaises(SystemExit):
@@ -136,6 +136,7 @@ class StatusTests(unittest.TestCase):
             for table in ('gen_metadata', 'executor_metadata'):
                 conn.execute(f'create table {table} (idx integer, data blob)')
             for gen, executor, state in ((256000, 256000, 'LIMITED_256K'),
+                                         (512000, 512000, 'EXPECTED_WINDOW'),
                                          (734000, 734000, 'EXPECTED_WINDOW'),
                                          (734000, 900000, 'EXPECTED_WINDOW'),
                                          (900000, 900000, 'EXPECTED_WINDOW'),
@@ -161,7 +162,7 @@ class StatusTests(unittest.TestCase):
                     self.assertTrue(inspect_session(db_path=path, expected_limit=None)['latest_limit_ok'])
                     self.assertFalse(inspect_session(db_path=path, expected_limit=734000)['latest_limit_ok'])
             # Also support live sessions where gen_metadata is populated and executor_metadata is empty.
-            for gen, state in ((734000, 'EXPECTED_WINDOW'), (900000, 'EXPECTED_WINDOW'), (256000, 'LIMITED_256K')):
+            for gen, state in ((512000, 'EXPECTED_WINDOW'), (734000, 'EXPECTED_WINDOW'), (900000, 'EXPECTED_WINDOW'), (256000, 'LIMITED_256K')):
                 conn.execute('delete from gen_metadata')
                 conn.execute('delete from executor_metadata')
                 g = field(1, field(3, 1419) + field(9, field(10, field(4, gen))) + field(19, b'gemini-4-argon'))

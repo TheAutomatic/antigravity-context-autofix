@@ -109,7 +109,7 @@ class RegressionTests(unittest.TestCase):
              patch.object(f, 'inspect_contexts', return_value=[{'state': 'UNKNOWN', 'error': 'none'}]), \
              contextlib.redirect_stdout(io.StringIO()):
             f.preflight([target], backup_dir=custom_bdir)
-        analyze.assert_called_once_with(target, backup_dir=custom_bdir)
+        analyze.assert_called_once_with(target, backup_dir=custom_bdir, context_limit=None)
 
     def test_replace_refuses_truncating_write_without_rollback(self):
         class WinError6(OSError):
