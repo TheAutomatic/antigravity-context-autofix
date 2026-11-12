@@ -83,6 +83,7 @@ class BinaryImage:
         self.fmt = None
         self.arch = None
         self.segments = []  # (name, va, vsize, raw_ptr, raw_size, is_exec)
+        self.sections = {}  # ELF section name -> (va, file_off, size)
         self._parse()
 
     def _parse(self):
@@ -136,6 +137,24 @@ class BinaryImage:
                         raise ValueError("Invalid ELF64 load segment")
                     is_exec = bool(p_flags & 1)
                     self.segments.append((f"LOAD_{i}", p_vaddr, max(p_memsz, p_filesz), p_offset, p_filesz, is_exec))
+            # Section headers (optional): needed to find .rela.dyn on PIE builds,
+            # where moduledata text pointers are zero in the file and only the
+            # R_*_RELATIVE addends carry the link-time VAs.
+            e_shoff = struct.unpack_from("<Q", self.data, 40)[0]
+            e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", self.data, 58)
+            if e_shoff and e_shentsize >= 64 and e_shoff + e_shentsize * e_shnum <= len(self.data) and e_shstrndx < e_shnum:
+                str_sh = self.data[e_shoff + e_shstrndx * e_shentsize : e_shoff + (e_shstrndx + 1) * e_shentsize]
+                str_off = struct.unpack_from("<Q", str_sh, 24)[0]
+                for i in range(e_shnum):
+                    sh = self.data[e_shoff + i * e_shentsize : e_shoff + (i + 1) * e_shentsize]
+                    name_off, _, _, s_va, s_off, s_size = struct.unpack_from("<IIQQQQ", sh, 0)
+                    if str_off + name_off >= len(self.data):
+                        continue
+                    end = self.data.find(b"\x00", str_off + name_off)
+                    if end == -1:
+                        continue
+                    name = self.data[str_off + name_off : end].decode("ascii", errors="replace")
+                    self.sections[name] = (s_va, s_off, s_size)
         elif self.data[:4] == bytes.fromhex("cffaedfe"):
             self.fmt = "Mach-O"
             if len(self.data) < 32:
@@ -308,6 +327,44 @@ def locate_go_functions(img: BinaryImage):
                                 break
                         if go_text_va != 0:
                             break
+            if go_text_va == 0 and img.fmt == "ELF" and ".rela.dyn" in img.sections:
+                # PIE ELF (ET_DYN): moduledata.text/etext are pointer slots that
+                # the dynamic loader fills via R_*_RELATIVE relocations, so the
+                # file bytes are zero and a raw moduledata scan cannot work.
+                # Recover the link-time VAs from the relocation addends instead:
+                # find consecutive slots (S, S+8) whose addends (minpc, maxpc)
+                # satisfy maxpc - minpc == ftab total_len with minpc inside an
+                # executable segment. Cross-check against a nearby relocation
+                # to the pclntab VA (moduledata.pcHeader precedes the pair).
+                rel_va, rel_off, rel_size = img.sections[".rela.dyn"]
+                rel_type = 8 if img.arch == "x86_64" else 1027  # R_X86_64_RELATIVE / R_AARCH64_RELATIVE
+                total_len = struct.unpack_from("<I", data, ftab_base + nfunc * 8)[0]
+                exec_ranges = [(sva, sva + svsize) for _, sva, svsize, _, _, is_exec in img.segments if is_exec]
+                pcln_va = next((sva + (idx - raw_ptr) for _, sva, _, raw_ptr, raw_size, _ in img.segments
+                                if raw_ptr <= idx < raw_ptr + raw_size), None)
+                relmap = {}
+                for i in range(rel_size // 24):
+                    r_offset, r_info, r_addend = struct.unpack_from("<QQq", data, rel_off + i * 24)
+                    if (r_info & 0xFFFFFFFF) == rel_type:
+                        relmap[r_offset] = r_addend
+                candidates = []
+                for slot, addend in relmap.items():
+                    if not any(lo <= addend < hi for lo, hi in exec_ranges):
+                        continue
+                    etext = relmap.get(slot + 8)
+                    if etext is None or etext - addend != total_len:
+                        continue
+                    # moduledata.pcHeader is the first field; the minpc/maxpc
+                    # (or text/etext) pair sits ~160-176 bytes after it, so a
+                    # relocation to the pclntab VA must appear just before.
+                    strong = pcln_va is not None and any(
+                        relmap.get(slot - d) == pcln_va for d in range(8, 264, 8))
+                    candidates.append((strong, addend))
+                strong_hits = {va for strong, va in candidates if strong}
+                if len(strong_hits) == 1:
+                    go_text_va = strong_hits.pop()
+                elif not strong_hits and len({va for _, va in candidates}) == 1:
+                    go_text_va = candidates[0][1]
             if go_text_va == 0:
                 raise RuntimeError("Found pclntab but could not resolve Go text base VA from moduledata")
             funcs = {}

@@ -10,8 +10,8 @@
 |---|---|---|---|
 | Windows | x86_64 / PE | Antigravity IDE、Antigravity Desktop、agy CLI | 本机 IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) 与 Desktop (`language_server.exe`) 已实测修改、启动与新请求窗口 |
 | Windows | ARM64 / PE | 暂不列入预期范围 | 未验证，不保证适配 |
-| Linux | x86_64 / ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
-| Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
+| Linux | x86_64 / ELF（含 PIE/ET_DYN） | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实测：Arch Linux（rolling，内核 7.2.14-zen1-1-zen，Python 3.14.9，glibc 2.44）上对 agy 1.5.5 & 1.5.6（Go 1.28 构建）与 Desktop `language_server` 完成修改、启动与新请求窗口验证（512000 / 734000）。PIE 构建的 moduledata 文本指针在文件中为 0，现通过 `.rela.dyn` 的 `R_*_RELATIVE` 附加数恢复 text 基址 |
+| Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持（含 PIE `.rela.dyn` 解析，`R_AARCH64_RELATIVE`）；仅有合成 ELF 单元测试覆盖，未完成 ARM64 实机验证 |
 | macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE / CLI (`agy` 1.4.12 & 1.5.0) 已实测修改、签名、启动与新请求窗口 |
 | macOS | x86_64（Intel）或 Universal Mach-O | 暂不支持 | 解析器只支持薄格式 ARM64 Mach-O |
 
