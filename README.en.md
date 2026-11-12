@@ -10,8 +10,8 @@ Patch the local Antigravity backend to lift the default 256K context cap for sup
 |---|---|---|---|
 | Windows | x86_64 / PE | Antigravity IDE, Antigravity Desktop, agy CLI | Locally verified on IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) and Desktop (`language_server.exe`): patching, startup and new request window |
 | Windows | ARM64 / PE | Outside the expected scope for now | Unvalidated; compatibility is not guaranteed |
-| Linux | x86_64 / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
-| Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
+| Linux | x86_64 / ELF (incl. PIE/ET_DYN) | agy CLI; IDE / Desktop installations using a compatible backend | Verified on Arch Linux (rolling, kernel 7.2.14-zen1-1-zen, Python 3.14.9, glibc 2.44) against agy 1.5.5 & 1.5.6 (Go 1.28 builds) and Desktop `language_server`: patching, startup and new request window (512000 / 734000). On PIE builds the moduledata text pointers are zero in the file; the text base is now recovered from `.rela.dyn` `R_*_RELATIVE` addends |
+| Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented (incl. PIE `.rela.dyn` parsing, `R_AARCH64_RELATIVE`); covered by synthetic ELF unit tests only, not yet verified on ARM64 hardware |
 | macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | Locally verified on IDE / CLI (`agy` 1.4.12 & 1.5.0): patching, signing, startup and new request window |
 | macOS | x86_64 (Intel) or Universal Mach-O | Unsupported | The parser only supports thin ARM64 Mach-O |
 
