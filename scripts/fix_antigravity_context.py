@@ -2,7 +2,7 @@
 """
 Automatic Go pclntab locator and context/rules patcher for Antigravity:
 - Supports Windows x86_64 PE (agy.exe for Antigravity IDE + CLI, language_server.exe for Antigravity Desktop)
-- Supports macOS ARM64 Mach-O (agy), with ad-hoc signing before replacement
+- Supports macOS ARM64 and x86_64 Mach-O (agy / language_server), with ad-hoc signing before replacement
 - Supports Linux x86_64 ELF and Linux ARM64 (aarch64) ELF (agy / language_server)
 - Zero third-party dependencies (Python 3 standard library only)
 
@@ -142,9 +142,12 @@ class BinaryImage:
             if len(self.data) < 32:
                 raise ValueError("Truncated Mach-O header")
             _, cpu, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from("<8I", self.data)
-            if cpu != 0x0100000C:
-                raise ValueError("Only thin ARM64 Mach-O is supported on macOS")
-            self.arch = "arm64"
+            if cpu == 0x0100000C:
+                self.arch = "arm64"
+            elif cpu == 0x01000007:
+                self.arch = "x86_64"
+            else:
+                raise ValueError(f"Unsupported Mach-O CPU: {hex(cpu)} (expected ARM64 0x100000c or x86_64 0x1000007)")
             end = 32 + sizeofcmds
             if end > len(self.data) or ncmds > sizeofcmds // 8:
                 raise ValueError("Invalid Mach-O load command table")
@@ -167,7 +170,7 @@ class BinaryImage:
                                           va, vsize, raw_ptr, raw_size, bool(prot & 4)))
                 off += size
         else:
-            raise ValueError("Unsupported binary format (expected PE, ELF or thin ARM64 Mach-O)")
+            raise ValueError("Unsupported binary format (expected PE, ELF or Mach-O)")
 
     def va_to_file(self, va: int) -> int:
         for _, sva, _, raw_ptr, raw_size, _ in self.segments:
@@ -1162,7 +1165,7 @@ def discover_default_targets() -> list[Path]:
     home = Path.home()
     names = ("agy.exe", "language_server.exe") if sys.platform == "win32" else (
         "agy", "language_server", "language_server_macos_arm", "language_server_macos_arm64",
-        "language_server_macos", "language_server_linux_x64", "language_server_linux_arm",
+        "language_server_macos", "language_server_macos_x64", "language_server_linux_x64", "language_server_linux_arm",
         "language_server_linux_arm64")
     candidates = [home / ".gemini/bin" / names[0], home / ".local/bin" / names[0]]
     for entry in os.environ.get("PATH", "").split(os.pathsep):
