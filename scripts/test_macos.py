@@ -32,6 +32,14 @@ class MachOTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             image.va_to_file(0x10000006C)
 
+    def test_x86_64_mapping(self):
+        header = struct.pack('<8I', 0xFEEDFACF, 0x01000007, 0, 2, 1, 72, 0, 0)
+        segment = struct.pack('<II16sQQQQiiII', 0x19, 72, b'__TEXT',
+                              0x100000000, 108, 0, 108, 7, 5, 0, 0)
+        image = f.BinaryImage(header + segment + bytes(4))
+        self.assertEqual((image.fmt, image.arch), ('Mach-O', 'x86_64'))
+        self.assertEqual(image.va_to_file(0x100000068), 104)
+
     def test_invalid_commands(self):
         for offset, value in ((20, 1000), (36, 0), (36, 200)):
             data = bytearray(self.image())

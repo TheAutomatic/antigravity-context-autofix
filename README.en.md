@@ -13,7 +13,8 @@ Patch the local Antigravity backend to lift the default 256K context cap for sup
 | Linux | x86_64 / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
 | Linux | ARM64 (aarch64) / ELF | agy CLI; IDE / Desktop installations using a compatible backend | Patch support implemented; current builds have not been tested on a Linux machine |
 | macOS | ARM64 (Apple Silicon) / thin Mach-O | Antigravity IDE, agy CLI | Locally verified on IDE / CLI (`agy` 1.4.12 & 1.5.0): patching, signing, startup and new request window |
-| macOS | x86_64 (Intel) or Universal Mach-O | Unsupported | The parser only supports thin ARM64 Mach-O |
+| macOS | x86_64 (Intel) / thin Mach-O | Antigravity Desktop, IDE, agy CLI | Verified on Desktop (`language_server` 2.29.0): patching, signing, startup and 1M context window |
+| macOS | Universal Mach-O | Unsupported | The parser only supports thin Mach-O (use lipo to extract thin slices if needed) |
 
 Each backend must pass local structural checks; compatibility across all versions is not guaranteed. Intended clients do not imply that every installation layout has been tested.
 

@@ -13,7 +13,8 @@
 | Linux | x86_64 / ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
 | Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持；当前版本未完成 Linux 实机验证 |
 | macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE / CLI (`agy` 1.4.12 & 1.5.0) 已实测修改、签名、启动与新请求窗口 |
-| macOS | x86_64（Intel）或 Universal Mach-O | 暂不支持 | 解析器只支持薄格式 ARM64 Mach-O |
+| macOS | x86_64（Intel）/ 薄格式 Mach-O | Antigravity Desktop、IDE、agy CLI | 本机 Desktop (`language_server` 2.29.0) 实测修改、签名、启动与 1M 窗口生效 |
+| macOS | Universal Mach-O | 暂不支持 | 解析器只支持薄格式 Mach-O（可用 lipo 提取单架构薄格式文件） |
 
 适用与否以本机后端的结构检查结果为准，不能保证所有版本。表中的客户端是预期范围，不代表每种安装布局均已实测。
 
