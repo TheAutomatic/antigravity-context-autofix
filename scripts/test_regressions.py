@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -685,6 +686,29 @@ class RegressionTests(unittest.TestCase):
                 data[offset+12:offset+16] = bytes.fromhex('1f2003d5')
                 target.write_bytes(data)
                 self.assertEqual(f.analyze_binary(target)['status'], 'UNKNOWN_OR_PARTIAL')
+
+    def test_windows_running_backends_handles_utf8_and_gbk_tasklist_bytes(self):
+        utf8_payload = ('"一.exe","111","Console","1","10,000 K"\r\n'
+                        '"language_server.exe","222","Console","1","50,000 K"\r\n').encode('utf-8')
+        gbk_payload = (b'"\xcd\xf8\xd2\xd7\xd4\xc6.exe","111","Console","1","10,000 K"\r\n'
+                       b'"agy.exe","333","Console","1","20,000 K"\r\n')
+        invalid_payload = (b'"\xffbad.exe","111","Console","1","10,000 K"\r\n'
+                           b'"agy.exe","333","Console","1","20,000 K"\r\n')
+
+        for payload, target_path, expected in (
+            (utf8_payload, Path('C:/x/language_server.exe'), [{'pid': 222, 'name': 'language_server.exe'}]),
+            (gbk_payload, Path('C:/x/agy.exe'), [{'pid': 333, 'name': 'agy.exe'}]),
+            (invalid_payload, Path('C:/x/agy.exe'), [{'pid': 333, 'name': 'agy.exe'}]),
+        ):
+            def fake_run(cmd, **kwargs):
+                self.assertFalse(kwargs.get('text'))
+                return subprocess.CompletedProcess(cmd, 0, stdout=payload, stderr=b'')
+
+            with patch.object(f.os, 'name', 'nt'), \
+                 patch.object(f.sys, 'platform', 'win32'), \
+                 patch.object(f.locale, 'getpreferredencoding', return_value='cp936'), \
+                 patch.object(f.subprocess, 'run', side_effect=fake_run):
+                self.assertEqual(f.running_backends([target_path]), expected)
 
 
 if __name__ == '__main__':

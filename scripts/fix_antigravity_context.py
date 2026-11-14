@@ -21,6 +21,7 @@ import argparse
 import csv
 import hashlib
 import json
+import locale
 import os
 import re
 import shutil
@@ -1117,11 +1118,26 @@ def update_agy_sidecar_if_present(target: Path):
         print(f"  [sidecar] Note: could not update {sidecar}: {e}")
 
 
+def _decode_command_output(raw) -> str:
+    """Decode subprocess bytes as UTF-8 first (e.g. Windows chcp 65001), falling back to locale."""
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        enc = locale.getpreferredencoding(False) or "utf-8"
+        return raw.decode(enc, errors="replace")
+
+
 def get_binary_version(target: Path) -> str:
     for flag in ("--version", "--stamp"):
         try:
-            res = subprocess.run([str(target), flag], capture_output=True, text=True, timeout=10)
-            out = (res.stdout + "\n" + res.stderr).strip()
+            res = subprocess.run([str(target), flag], capture_output=True, timeout=10)
+            stdout = _decode_command_output(res.stdout)
+            stderr = _decode_command_output(res.stderr)
+            out = (stdout + "\n" + stderr).strip()
             if out:
                 first_line = out.splitlines()[0].strip()
                 for line in out.splitlines():
@@ -1269,9 +1285,9 @@ def patch_target(target: Path, backup_dir: Path, dry_run: bool = False, context_
                 raise RuntimeError("Mach-O patching requires macOS codesign")
             # Sign and verify the temporary file before replacing the backend.
             subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(tmp_path)],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, encoding="utf-8", errors="replace")
             subprocess.run(["/usr/bin/codesign", "--verify", "--strict", str(tmp_path)],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, encoding="utf-8", errors="replace")
             if analyze_binary(tmp_path)["status"] != "ALREADY_PATCHED":
                 raise RuntimeError("Signed binary failed patch verification")
         patched_sha256 = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
@@ -1396,7 +1412,7 @@ def running_backends(targets):
                 continue  # Process exited, or kernel thread has no executable.
             except PermissionError:
                 # Inaccessible processes must not silently bypass the guard.
-                name = (directory / "comm").read_text().strip()
+                name = (directory / "comm").read_text(encoding="utf-8", errors="replace").strip()
                 if any(n[:15] == name for n in names):
                     raise RuntimeError(f"Cannot inspect possible backend PID={directory.name} name={name}")
                 continue
@@ -1405,13 +1421,14 @@ def running_backends(targets):
         return found
     if os.name == "nt":
         result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                                check=True, capture_output=True, text=True)
-        return [{"pid": int(row[1]), "name": row[0]} for row in csv.reader(result.stdout.splitlines())
+                                check=True, capture_output=True)
+        text = _decode_command_output(result.stdout)
+        return [{"pid": int(row[1]), "name": row[0]} for row in csv.reader(text.splitlines())
                 if len(row) >= 2 and row[0].lower() in names]
     result = subprocess.run(["ps", "-axo", "pid=,comm="],
-                            check=True, capture_output=True, text=True)
+                            check=True, capture_output=True)
     found = []
-    for line in result.stdout.splitlines():
+    for line in _decode_command_output(result.stdout).splitlines():
         parts = line.strip().split(None, 1)
         if len(parts) == 2 and Path(parts[1]).name.lower() in names:
             found.append({"pid": int(parts[0]), "name": Path(parts[1]).name})
