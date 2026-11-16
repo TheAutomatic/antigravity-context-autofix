@@ -138,7 +138,7 @@ python3 scripts/verify_session.py --db /实际路径/session.db
 
 ## 修改内容与 Mac 签名
 
-- **可选压缩阈值**：在最终配置出口处，将默认的 checkpoint.max_token_limit=256000 提升到所选阈值：默认 512000、菜单选项 2 为 734000，或 --context-limit 指定的数值。保留 hooks.checkpointNeeded 原生压缩与 ClampCheckpointConfigForModelInfo 模型安全裁剪。
+- **可选压缩阈值**：功能配置合并后，用所选阈值覆盖 `checkpoint.max_token_limit`。菜单默认 512000，选项 2 为 734000，也可用 `--context-limit 40000` 指定更低的阈值。原生自动压缩和模型安全上限继续生效。旧补丁可使用经校验的原版备份升级。
 - **窗口缓冲**：对于 1048576-token 窗口的模型，默认 512000 阈值留出 536576 tokens，选项 2 留出 314576 tokens。自定义阈值越接近模型上限，留给单轮突发读取与分词误差的空间越少。
 - **完整保留 `hooks.checkpointNeeded` 原版指令**（不短路自动压缩判断），改为在 `(*CheckpointConfig)` 的一组候选宿主中挑选：优先 `SetSessionSummaryPromptOverride`，该符号被链接器裁掉时改用其余 `(*CheckpointConfig).*` 方法中**没有外部进入**（同时检查 CALL/JMP 与 B/BL/B.cond/CBZ，函数内部自跳转不算）、**地址没有被存进任何非调试段**（可执行段内的常量/指针也计入，仅排除 `__DWARF` / `.debug` 等调试段，因为那里记录的是每个函数的绝对地址）、长度足够的一个；实际宿主写入清单。
 - 规则 / skill 单文件读取上限从24000字节提高到 **1 MiB**。
@@ -178,7 +178,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 |---|---|
 | 无参数 | 自动发现、检查，确认后修改未修补目标 |
 | --status / --check / --dry-run | 只检查 |
-| --context-limit TOKENS | 自定义整数压缩阈值，范围 256001–1048576；跳过阈值菜单，仍需输入 Y 确认修改 |
+| --context-limit TOKENS | 自定义整数压缩阈值，范围 1–1048576；跳过阈值菜单，仍需输入 Y 确认修改 |
 | --target PATH | 指定目标，支持重复，替代自动发现 |
 | --conversation-id UUID / --db PATH | 二选一，指定查询会话 |
 | --restore | 核验备份、确认并恢复；与 --json-out 一起使用可输出恢复前后哈希和备份来源 |

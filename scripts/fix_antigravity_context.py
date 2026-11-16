@@ -10,7 +10,7 @@ What it patches (dynamically located via Go 1.20+ pclntab & getter instruction d
 1. applyFeatureProviderCheckpointOverrideConfig -> jumps to a trampoline placed at +0x20 of an unreferenced
    (*CheckpointConfig) setter (SetSessionSummaryPromptOverride first, then any uncalled Set* method)
 2. that setter -> returns at entry; hosts the universal 1M context trampoline
-   Lifts default 256000 max_token_limit to a selected budget (512000 by default) for all 1M models while keeping hooks.checkpointNeeded and ClampCheckpointConfigForModelInfo intact
+   Sets max_token_limit to the selected budget after the feature config merge while keeping hooks.checkpointNeeded and ClampCheckpointConfigForModelInfo intact
 3. readGlobalRules / parseRuleFile / convertSkillPath -> per-file byte limit 24000 -> 1048576 (1 MiB)
 4. computeTruncatedCustomizations -> rules & customizations token budgets 20000 -> 131072 tokens
 """
@@ -44,8 +44,8 @@ TARGET_FUNCS = {
     "computeTruncated": "google3/third_party/jetski/cortex/customizations/customizations.(*Manager).computeTruncatedCustomizations",
 }
 
-# The trampoline overwrites one unreferenced function entry plus 46 (x86_64) or
-# 48 (arm64) bytes at +0x20, so the host must stay byte-exactly restorable and
+# The trampoline overwrites one unreferenced function entry and 46 (x86_64)
+# or 48 (arm64) bytes at +0x20, so the host must stay byte-exactly restorable and
 # must never be reached. Preferred hosts are CheckpointConfig setters that
 # 1.4.12 and 1.5.0 builds never call; other builds let the linker drop them, so
 # any remaining (*CheckpointConfig).Set* method without a call site also works.
@@ -63,7 +63,7 @@ HOST_PREFERENCE = (
     "(*CheckpointConfig).SetCheckpointPromptOverride",
     "(*CheckpointConfig).SetContinuationPromptOverride",
 ) + HOST_FALLBACK_SYMBOLS
-HOST_SPAN = {"x86_64": 0x20 + 46, "arm64": 0x20 + 48}  # entry + 0x20 + trampoline
+HOST_SPAN = {"x86_64": 0x20 + 46, "arm64": 0x20 + 48}
 HOST_NOOP_ENTRY = {
     "x86_64": bytes.fromhex("31c031db31c9c3"),
     "arm64": struct.pack("<4I", 0xD2800000, 0xD2800001, 0xD2800002, 0xD65F03C0),
@@ -72,7 +72,6 @@ HOST_NOOP_ENTRY = {
 DATA_SEGMENT_SKIP = ("__DWARF", "__LINKEDIT", "__eh_frame", ".debug", ".zdebug",
                      ".reloc", ".rela", ".rsrc", ".symtab", ".strtab", ".comment", ".note")
 
-DEFAULT_256K_TOKEN_LIMIT = 256000
 DEFAULT_CONTEXT_LIMIT = 512000
 HIGH_CONTEXT_LIMIT = 734000
 MAX_CONTEXT_LIMIT = 1048576
@@ -736,45 +735,29 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict, context_limit=DEFAULT_CONTE
     if not (-0x80000000 <= jmp_to_tramp_rel <= 0x7FFFFFFF):
         raise RuntimeError("Trampoline is out of 32-bit relative jump range")
     jmp_back_rel = (exit_va + 6) - (tramp_va + 46)
-
     if exit_layout == "rax_rcx":
         exit_before = bytes([0x48, 0x89, 0x48, checkpoint_off, 0x31, 0xDB])
         exit_after = b"\xe9" + struct.pack("<i", jmp_to_tramp_rel) + b"\x90"
-        tramp_after = (
-            b"\x48\x85\xc9"                                  # test rcx, rcx
-            b"\x74\x1e"                                      # je .done (+30 -> 35)
-            + bytes([0x48, 0x8B, 0x50, planner_off])         # mov rdx, [rax + planner_off]
-            + b"\x48\x85\xd2"                                # test rdx, rdx
-            + b"\x74\x15"                                    # je .done (+21 -> 35)
-            + bytes([0x8B, 0x51, max_limit_off])             # mov edx, [rcx + max_limit_off]
-            + b"\x81\xfa" + struct.pack("<I", DEFAULT_256K_TOKEN_LIMIT)  # cmp edx, 256000
-            + b"\x75\x0a"                                    # jne .done (+10 -> 35)
-            + b"\x0f\x1f\x00"                                # nop dword ptr [rax]
-            + bytes([0xC7, 0x41, max_limit_off])             # mov selected budget
-            + struct.pack("<I", context_limit)
-            + bytes([0x48, 0x89, 0x48, checkpoint_off])      # .done: mov [rax + checkpoint_off], rcx
-            + b"\x31\xdb"                                    # xor ebx, ebx
-            + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6)
-        )
+        test_checkpoint = b"\x48\x85\xc9"                  # test rcx, rcx
+        set_limit = bytes([0xC7, 0x41, max_limit_off])      # mov dword ptr [rcx + max_limit_off], imm32
+        store_checkpoint = exit_before[:4]
     else:
         exit_before = bytes([0x48, 0x89, 0x42, checkpoint_off, 0x48, 0x89, 0xD0, 0x31, 0xDB])
         exit_after = b"\xe9" + struct.pack("<i", jmp_to_tramp_rel) + b"\x90\x48\x89\xd0"
-        tramp_after = (
-            b"\x48\x85\xc0"                                  # test rax, rax
-            b"\x74\x1e"                                      # je .done (+30 -> 35)
-            + bytes([0x48, 0x8B, 0x4A, planner_off])         # mov rcx, [rdx + planner_off]
-            + b"\x48\x85\xc9"                                # test rcx, rcx
-            + b"\x74\x15"                                    # je .done (+21 -> 35)
-            + bytes([0x8B, 0x48, max_limit_off])             # mov ecx, [rax + max_limit_off]
-            + b"\x81\xf9" + struct.pack("<I", DEFAULT_256K_TOKEN_LIMIT)  # cmp ecx, 256000
-            + b"\x75\x0a"                                    # jne .done (+10 -> 35)
-            + b"\x0f\x1f\x00"                                # nop dword ptr [rax]
-            + bytes([0xC7, 0x40, max_limit_off])             # mov selected budget
-            + struct.pack("<I", context_limit)
-            + bytes([0x48, 0x89, 0x42, checkpoint_off])      # .done: mov [rdx + checkpoint_off], rax
-            + b"\x31\xdb"                                    # xor ebx, ebx
-            + b"\xe9" + struct.pack("<i", jmp_back_rel)      # jmp (exit_va + 6 -> mov rax, rdx)
-        )
+        test_checkpoint = b"\x48\x85\xc0"                  # test rax, rax
+        set_limit = bytes([0xC7, 0x40, max_limit_off])      # mov dword ptr [rax + max_limit_off], imm32
+        store_checkpoint = exit_before[:4]
+    # Keep the immediate and checkpoint store at the offsets used to identify older patches.
+    tramp_after = (
+        test_checkpoint
+        + b"\x74\x1e"                                      # je .done (offset 35)
+        + b"\xeb\x15"                                      # jmp .write (offset 28)
+        + b"\x90" * 21
+        + set_limit + struct.pack("<I", context_limit)     # .write
+        + store_checkpoint                                 # .done
+        + b"\x31\xdb"                                      # xor ebx, ebx
+        + b"\xe9" + struct.pack("<i", jmp_back_rel)        # jmp (exit_va + 6)
+    )
     assert len(tramp_after) == 46
     chk_entry_after = b"\x31\xc0\x31\xdb\x31\xc9\xc3"
 
@@ -874,7 +857,7 @@ def build_x86_64_plan(img: BinaryImage, funcs: dict, context_limit=DEFAULT_CONTE
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit={context_limit} trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: set merged checkpoint max_token_limit={context_limit}",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -964,7 +947,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict, context_limit=DEFAULT_CONTEX
                 exit_candidates.append((off, config, checkpoint, scratch, store))
     if len(exit_candidates) != 1:
         raise RuntimeError(f"Expected 1 exit store in ARM64 applyOverride, found {len(exit_candidates)}")
-    exit_rel, config, checkpoint, scratch, checkpoint_store = exit_candidates[0]
+    exit_rel, _, checkpoint, scratch, checkpoint_store = exit_candidates[0]
     exit_va = f_apply["va_start"] + exit_rel
     exit_foff = f_apply["file_start"] + exit_rel
 
@@ -978,12 +961,8 @@ def build_arm64_plan(img: BinaryImage, funcs: dict, context_limit=DEFAULT_CONTEX
     chk_entry_after = struct.pack("<4I", 0xD2800000, 0xD2800001, 0xD2800002, 0xD65F03C0)
     tramp_insns = [
         0xB4000140 | checkpoint,                              # cbz checkpoint, .done
-        0xF9400000 | ((planner_off // 8) << 10) | (config << 5) | scratch,
-        0xB4000100 | scratch,                                 # cbz planner, .done
-        0xB9400000 | ((max_limit_off // 4) << 10) | (checkpoint << 5) | scratch,  # ldr w_scratch, [checkpoint, #max_limit_off]
-        0x5140F800 | (scratch << 5) | scratch,                 # sub w_scratch, w_scratch, #0x3e000 (253952)
-        0x7120001F | (scratch << 5),                           # cmp w_scratch, #0x800 (2048 -> total 256000)
-        0x54000081,                                           # b.ne .done
+        0x14000006,                                           # b .write (word 7)
+        *([0xD503201F] * 5),                                  # keep the budget immediate at its existing offset
         0x52800000 | ((context_limit & 0xFFFF) << 5) | scratch,          # movz scratch, low 16 bits
         0x72A00000 | (((context_limit >> 16) & 0xFFFF) << 5) | scratch,  # movk scratch, high 16 bits
         0xB9000000 | ((max_limit_off // 4) << 10) | (checkpoint << 5) | scratch,
@@ -1041,7 +1020,7 @@ def build_arm64_plan(img: BinaryImage, funcs: dict, context_limit=DEFAULT_CONTEX
         },
         {
             "name": "trampolineHost_trampoline",
-            "purpose": f"{f_chk['symbol']}+0x20: universal 1M context max_token_limit={context_limit} trampoline",
+            "purpose": f"{f_chk['symbol']}+0x20: set merged checkpoint max_token_limit={context_limit}",
             "va": hex(tramp_va),
             "offset": hex(tramp_foff),
             "before": data[tramp_foff : tramp_foff + len(tramp_after)].hex(),
@@ -1198,10 +1177,10 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None, context_
     sha256 = hashlib.sha256(data).hexdigest()
     img = BinaryImage(data)
     pcln_off, go_text_va, funcs, hosts = locate_go_functions(img)
+    selected_limit = context_limit or DEFAULT_CONTEXT_LIMIT
     try:
         host, host_ambiguous = choose_trampoline_host(img, funcs, hosts, go_text_va)
         funcs = dict(funcs, trampolineHost=host)
-        selected_limit = context_limit or DEFAULT_CONTEXT_LIMIT
         # Read-only analysis recognises any complete patch generated with a valid
         # threshold. The complete plan below still validates every patched byte.
         if context_limit is None:
@@ -1214,12 +1193,12 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None, context_
                 else:
                     low, high = struct.unpack_from("<II", data, trampoline + 28)
                     candidate = ((low >> 5) & 0xFFFF) | (((high >> 5) & 0xFFFF) << 16)
-                if DEFAULT_256K_TOKEN_LIMIT < candidate <= MAX_CONTEXT_LIMIT:
+                if 1 <= candidate <= MAX_CONTEXT_LIMIT:
                     selected_limit = candidate
         plan = (build_x86_64_plan(img, funcs, selected_limit) if img.arch == "x86_64"
                 else build_arm64_plan(img, funcs, selected_limit))
     except RuntimeError:
-        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir, context_limit)
+        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir, selected_limit)
         if upgraded is not None:
             return upgraded
         raise
@@ -1257,8 +1236,8 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None, context_
         for change in (entry, trampoline):
             current, patched = bytes.fromhex(change["before"]), bytes.fromhex(change["after"])
             if img.arch == "arm64":
-                # Original store may legitimately occur in the discarded body.
-                excluded = {40} if change is trampoline else set()
+                # Alignment NOPs and the original store may occur in the discarded body.
+                excluded = {8, 12, 16, 20, 24, 40} if change is trampoline else set()
                 partial |= any(current[i:i+4] == patched[i:i+4]
                                for i in range(0, len(patched), 4) if i not in excluded)
             else:
@@ -1268,7 +1247,7 @@ def analyze_binary(target: Path, backup_dir: Path | bool | None = None, context_
         status = "UNKNOWN_OR_PARTIAL"
 
     if status == "UNKNOWN_OR_PARTIAL":
-        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir, context_limit)
+        upgraded = _try_upgrade_from_verified_backup(target, sha256, backup_dir, selected_limit)
         if upgraded is not None:
             return upgraded
     return {
@@ -1720,10 +1699,12 @@ def replace_with_retry(source, target, expected_sha256, rollback_bytes=None):
 def inspect_context(conversation_id=None, db_path=None):
     """Read historical request metadata; absence or parse failure is never 'locked'."""
     from verify_session import inspect_session, database_activity, find_conversation_db, ACCEPTED_LIMITS
+    location = {}
     try:
         target_db = db_path.expanduser().resolve() if db_path else find_conversation_db(conversation_id)
-        recorded_at = database_activity(target_db)
-        report = inspect_session(conversation_id=conversation_id, db_path=db_path)
+        location["db_path"] = str(target_db)
+        location["recorded_at"] = database_activity(target_db)
+        report = inspect_session(db_path=target_db)
         latest = report["latest_turn"]
         gen_lim = latest["gen_max_context_tokens"]
         exec_lim = latest.get("executor_max_token_limit")
@@ -1736,11 +1717,11 @@ def inspect_context(conversation_id=None, db_path=None):
         else:
             state = "OTHER_WINDOW"
         report["state"] = state
-        report["recorded_at"] = recorded_at
+        report.update(location)
         report["scope"] = "Latest stored request only; model and current running backend are not verified."
         return report
     except (Exception, SystemExit) as exc:
-        return {"state": "UNKNOWN", "error": str(exc),
+        return {**location, "state": "UNKNOWN", "error": str(exc),
                 "scope": "No conclusion about context limit; DB may be absent, busy, empty or use a new schema."}
 
 
@@ -1851,6 +1832,9 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
         if st == "ALREADY_PATCHED":
             st_badge = _style("[✓ 已打补丁 / ALREADY_PATCHED]", "1;32", c_on)
             compat_badge = _style("[✓ 兼容 / Compatible]", "32", c_on)
+        elif info.get("upgrade_from_backup"):
+            st_badge = _style("[↑ 可升级 / UPGRADE AVAILABLE]", "1;33", c_on)
+            compat_badge = _style("[✓ 已校验原版备份 / Verified original backup]", "32", c_on)
         elif st == "UNPATCHED":
             st_badge = _style("[● 未打补丁 / UNPATCHED]", "1;33", c_on)
             compat_badge = _style("[✓ 可打补丁 / Ready to Patch]", "1;32", c_on)
@@ -1860,7 +1844,8 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
 
         meta = ""
         if "error" not in info:
-            meta = _style(f"({info['format']} {info['arch']}, {len(info['changes'])} sites, sha256:{info['sha256'][:10]}..)", "2", c_on)
+            disk_sha256 = info.get("target_disk_sha256", info["sha256"])
+            meta = _style(f"({info['format']} {info['arch']}, {len(info['changes'])} sites, sha256:{disk_sha256[:10]}..)", "2", c_on)
         print(f"  #{idx}  " + _style(p_obj.name, "1", c_on) + f"  [{role}]  {meta}")
         print(f"      Path   : {info['path']}")
         print(f"      Status : {st_badge}  {compat_badge}")
@@ -1892,8 +1877,7 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
                 if r_ctx is None:
                     r_ctx = inspect_context(db_path=db_f)
                     r_ctx["source"] = str(d)
-                if "latest_turn" in r_ctx:
-                    recent_list.append(r_ctx)
+                recent_list.append(r_ctx)
         recent_list.sort(key=lambda x: x.get("recorded_at", 0), reverse=True)
         if recent_list:
             display_sessions = recent_list[:5]
@@ -1901,7 +1885,7 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
     for s_idx, session in enumerate(display_sessions, 1):
         st = session["state"]
         if st == "EXPECTED_WINDOW":
-            ctx_badge = _style("[✓ 1M 已生效 / 1M ACTIVE]", "1;32", c_on)
+            ctx_badge = _style("[i 当前上下文 / CURRENT CONTEXT]", "1;36", c_on)
         elif st == "LIMITED_256K":
             ctx_badge = _style("[! 256K 限制 / LIMITED_256K]", "1;33", c_on)
         elif st == "MIXED_LIMITS":
@@ -1920,7 +1904,7 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
             if session.get("recorded_at"):
                 ago_sec = max(0, int(time.time() - session["recorded_at"]))
                 ago_str = f"{ago_sec}s" if ago_sec < 60 else (f"{ago_sec // 60}m" if ago_sec < 3600 else f"{ago_sec // 3600}h")
-            src_name = Path(session.get("source", "")).parent.name
+            src_name = Path(session.get("source", str(Path(session["db_path"]).parent))).parent.name
             surface = "CLI" if "cli" in src_name.lower() else "IDE/App"
             cid_short = Path(session["db_path"]).stem[:8]
             proj = session.get("project") or "-"
@@ -1935,7 +1919,8 @@ def preflight(targets, conversation_id=None, db_path=None, backup_dir: Path | bo
                 filled = min(16, int(round(16 * used / req_lim)))
                 bar_str = "█" * filled + "░" * (16 - filled)
                 bar_color = "32" if pct < 75 else ("33" if pct < 90 else "31")
-                print(f"      Usage : {_style(bar_str, bar_color, c_on)}  {used:,} / {req_lim:,} tokens ({pct:.1f}%)")
+                executor = f"  |  Executor={exe_lim:,}" if exe_lim is not None else ""
+                print(f"      Usage : {_style(bar_str, bar_color, c_on)}  {used:,} / {req_lim:,} tokens ({pct:.1f}%){executor}")
             else:
                 exe_str = f"{exe_lim:,}" if exe_lim is not None else "-"
                 print(f"      Limits: Request={req_lim:,}  |  Executor={exe_str}")
@@ -2045,8 +2030,8 @@ def parse_context_limit(value):
         limit = int(value)
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError("Context limit must be an integer token count")
-    if not DEFAULT_256K_TOKEN_LIMIT < limit <= MAX_CONTEXT_LIMIT:
-        raise argparse.ArgumentTypeError("Context limit must be between 256001 and 1048576 tokens")
+    if not 1 <= limit <= MAX_CONTEXT_LIMIT:
+        raise argparse.ArgumentTypeError(f"Context limit must be between 1 and {MAX_CONTEXT_LIMIT} tokens")
     return limit
 
 
@@ -2219,7 +2204,7 @@ def main():
     ap.add_argument("--kill", action="store_true", help="Terminate running agy.exe / language_server.exe processes before patching.")
     ap.add_argument("--backup-dir", type=Path, default=Path.home() / ".gemini" / "agy-patches", help="Directory to store original backups and manifests.")
     ap.add_argument("--json-out", type=Path, help="Optional path to write full analysis/patch report as JSON.")
-    ap.add_argument("--context-limit", type=parse_context_limit, help="Auto-compaction token budget (256001..1048576); skips the 512K/734K menu. Default menu choice: 512000.")
+    ap.add_argument("--context-limit", type=parse_context_limit, help=f"Auto-compaction token budget (1..{MAX_CONTEXT_LIMIT}); skips the 512K/734K menu. Default menu choice: 512000.")
     args = ap.parse_args()
     args.dry_run = args.dry_run or args.status
     if args.restore and args.dry_run:

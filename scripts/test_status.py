@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fix_antigravity_context as f
+import verify_session as v
 
 
 def varint(n):
@@ -187,6 +188,51 @@ class StatusTests(unittest.TestCase):
             result = f.preflight([Path('missing')])
         self.assertFalse(result['compatible'])
         self.assertEqual(result['session']['state'], 'UNKNOWN')
+
+    def test_recent_session_with_empty_wal_and_read_only_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            ping = directory / 'ping.db'
+            older = directory / 'old.db'
+            unreadable = directory / 'unreadable.db'
+            for path, timestamp in ((ping, 300), (older, 100), (unreadable, 400)):
+                with contextlib.closing(sqlite3.connect(path)) as conn:
+                    conn.execute('pragma journal_mode=wal')
+                    conn.execute('create table gen_metadata (idx integer, data blob)')
+                    conn.execute('create table executor_metadata (idx integer, data blob)')
+                    if path != unreadable:
+                        gen = field(1, field(9, field(10, field(4, 512000) + field(1, 100))))
+                        exe = field(10, field(2, field(5, 512000)))
+                        conn.execute('insert into gen_metadata values (0, ?)', (gen,))
+                        conn.execute('insert into executor_metadata values (0, ?)', (exe,))
+                    conn.commit()
+                os.utime(path, (timestamp, timestamp))
+                wal = path.with_name(path.name + '-wal')
+                wal.touch()
+                os.utime(wal, (500, 500))
+                path.with_name(path.name + '-shm').touch()
+
+            connect = sqlite3.connect
+
+            def read_only_connect(database, **kwargs):
+                if database.startswith(directory.resolve().as_uri() + '/'):
+                    raise sqlite3.OperationalError('unable to open database file')
+                return connect(database, **kwargs)
+
+            output = io.StringIO()
+            with patch.object(v, 'conversation_dirs', return_value=[directory]), \
+                 patch.object(sqlite3, 'connect', side_effect=read_only_connect), \
+                 contextlib.redirect_stdout(output):
+                f.preflight([])
+                self.assertEqual(v.inspect_session(db_path=ping)['read_mode'], 'stable_standalone_copy')
+                ping.with_name(ping.name + '-wal').write_bytes(b'nonempty')
+                self.assertEqual(f.inspect_context(db_path=ping)['state'], 'UNKNOWN')
+            display = output.getvalue()
+            self.assertLess(display.index('unreadable'), display.index('ping'))
+            self.assertLess(display.index('ping'), display.index('old'))
+            self.assertIn('Session has no request metadata yet', display)
+            self.assertIn('[i 当前上下文 / CURRENT CONTEXT]', display)
+            self.assertIn('Executor=512,000', display)
 
 
 if __name__ == '__main__':

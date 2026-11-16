@@ -134,9 +134,9 @@ Acceptance reports `latest_limit_ok: true` when limits match. A stored window do
 
 ## Changes and signing
 
-- **Selected compaction budget**: At the final config merge, a default checkpoint limit of 256000 is raised to the selected budget: 512000 by default, 734000 for menu option 2, or the explicit --context-limit value. The native hooks.checkpointNeeded compaction and ClampCheckpointConfigForModelInfo model safety clamping remain intact.
+- **Selected compaction budget**: After the feature config merge, the patch overwrites `checkpoint.max_token_limit` with the selected budget. Choose the default 512000, menu option 2 for 734000, or specify a lower value such as `--context-limit 40000`. Native automatic compaction and the model's safety ceiling still apply. A verified original backup allows upgrades from earlier patches.
 - **Headroom**: For a model with a 1,048,576-token window, the default 512000 budget leaves 536576 tokens of headroom; option 2 leaves 314576 tokens. A custom budget nearer the model limit leaves less room for bursts and tokenizer variance.
-- **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction works seamlessly. The 46/48-byte trampoline goes into one (*CheckpointConfig) method chosen at patch time: `SetSessionSummaryPromptOverride` first, otherwise any other `(*CheckpointConfig).*` method that nothing enters from outside (CALL/JMP and B/BL/B.cond/CBZ are checked; a jump inside the body does not count), whose address is not stored in any non-debug segment (constants and pointers inside executable segments count too; `__DWARF`/`.debug` are ignored because they list every function address), and that is large enough. The chosen symbol is written to the manifest.
+- **Keep `hooks.checkpointNeeded` 100% intact** so native automatic `<CONTEXT_SUMMARY>` compaction works seamlessly. The trampoline goes into one (*CheckpointConfig) method chosen at patch time: `SetSessionSummaryPromptOverride` first, otherwise any other `(*CheckpointConfig).*` method that nothing enters from outside (CALL/JMP and B/BL/B.cond/CBZ are checked; a jump inside the body does not count), whose address is not stored in any non-debug segment (constants and pointers inside executable segments count too; `__DWARF`/`.debug` are ignored because they list every function address), and that is large enough. The chosen symbol is written to the manifest.
 - Raise per-file rule / skill cap from 24000 bytes to **1 MiB**.
 - Raise rules and customizations budgets from 20000 to **131072 tokens** each.
 - If a target binary carries an older patch (e.g. 900K / 983K) and a SHA256-verified original backup exists in the backup directory, the patcher seamlessly upgrades the binary from the verified original backup.
@@ -174,7 +174,7 @@ python3 scripts/fix_antigravity_context.py --status --json-out report.json
 |---|---|
 | No flags | Discover, inspect, confirm and patch original targets |
 | --status / --check / --dry-run | Inspect only |
-| --context-limit TOKENS | Custom integer compaction budget, 256001–1048576; skips the threshold menu, while Y confirmation remains required |
+| --context-limit TOKENS | Custom integer compaction budget, 1–1048576; skips the threshold menu, while Y confirmation remains required |
 | --target PATH | Repeatable explicit targets; replaces discovery |
 | --conversation-id UUID / --db PATH | Choose one precise session |
 | --restore | Verify backups, confirm and restore; --json-out includes before/after hashes and backup source |

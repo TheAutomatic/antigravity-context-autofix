@@ -84,12 +84,13 @@ def conversation_dirs():
 
 def database_activity(path):
     """Include uncheckpointed request writes when selecting a recent session."""
-    times = [path.stat().st_mtime]
+    modified = path.stat().st_mtime
     try:
-        times.append(Path(str(path) + "-wal").stat().st_mtime)
+        wal = path.with_name(path.name + "-wal").stat()
     except FileNotFoundError:
-        pass
-    return max(times)
+        return modified
+    # Opening older sessions can recreate empty WAL files without a new request.
+    return max(modified, wal.st_mtime) if wal.st_size else modified
 
 
 def find_conversation_db(cid: str | None) -> Path:
@@ -208,23 +209,34 @@ def parse_exec_row(e: bytes):
 
 @contextmanager
 def open_session_db(db_path):
-    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn = None
     try:
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
         conn.execute("select name from sqlite_master limit 1").fetchone()
     except sqlite3.OperationalError:
-        conn.close()
+        if conn is not None:
+            conn.close()
         # Some read-only directories cannot supply SQLite's shared-memory files.
-        # Only copy a stable standalone database; never ignore a WAL.
-        if any(Path(str(db_path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+        # An empty WAL has no transactions to copy. SHM contains only the WAL index.
+        wal_path = db_path.with_name(db_path.name + "-wal")
+        journal_path = db_path.with_name(db_path.name + "-journal")
+
+        def file_state(path):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                return None
+            return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+        wal_before = file_state(wal_path)
+        if (wal_before is not None and wal_before[1]) or journal_path.exists():
             raise
-        before = db_path.stat()
+        before = file_state(db_path)
         with tempfile.TemporaryDirectory(prefix="agy-db-read-") as folder:
             copy = Path(folder) / "session.db"
             shutil.copyfile(db_path, copy)
-            after = db_path.stat()
-            if ((before.st_ino, before.st_size, before.st_mtime_ns) !=
-                    (after.st_ino, after.st_size, after.st_mtime_ns) or
-                    any(Path(str(db_path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal"))):
+            if (before != file_state(db_path) or wal_before != file_state(wal_path)
+                    or journal_path.exists()):
                 raise RuntimeError("Session DB changed during snapshot; retry or close the IDE")
             conn = sqlite3.connect(copy.as_uri() + "?mode=ro&immutable=1", uri=True)
             try:

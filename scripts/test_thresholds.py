@@ -124,17 +124,18 @@ class ThresholdTests(unittest.TestCase):
         with patch('builtins.input', side_effect=EOFError), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):
                 f.choose_context_limit()
-        for value in ('256000', '1048577', '512k', '-1'):
+        for value in ('0', '1048577', '512k', '-1'):
             with self.assertRaises(argparse.ArgumentTypeError):
                 f.parse_context_limit(value)
-        self.assertEqual(f.parse_context_limit('600000'), 600000)
+        for limit in (1, 40000, 256000, 600000, 1048576):
+            self.assertEqual(f.parse_context_limit(str(limit)), limit)
 
     def test_both_architectures_encode_detect_and_switch_thresholds(self):
         for arch in ('x86_64', 'arm64'):
             for newer in (False, True):
                 img, funcs = fixture(arch, newer)
                 builder = f.build_x86_64_plan if arch == 'x86_64' else f.build_arm64_plan
-                for limit in (512000, 734000, 600123):
+                for limit in (1, 40000, 512000, 734000, 1048576):
                     with self.subTest(arch=arch, newer=newer, limit=limit):
                         plan = builder(img, funcs, limit)
                         out = bytearray(img.data)
@@ -145,9 +146,16 @@ class ThresholdTests(unittest.TestCase):
                         trampoline = bytes.fromhex(plan['changes'][2]['after'])
                         if arch == 'x86_64':
                             encoded = struct.unpack_from('<I', trampoline, 31)[0]
+                            self.assertEqual(trampoline[3:7], b'\x74\x1e\xeb\x15')
+                            self.assertEqual(trampoline[28:31], b'\xc7\x40\x0c' if newer else b'\xc7\x41\x0c')
                         else:
                             low, high = struct.unpack_from('<II', trampoline, 28)
                             encoded = (low >> 5 & 0xFFFF) | (high >> 5 & 0xFFFF) << 16
+                            on_null, on_valid = struct.unpack_from('<II', trampoline)
+                            self.assertEqual(on_null, 0xB4000140 if newer else 0xB4000141)
+                            self.assertEqual(on_valid, 0x14000006)
+                            self.assertEqual(struct.unpack_from('<I', trampoline, 36)[0],
+                                             0xB9000C04 if newer else 0xB9000C23)
                         self.assertEqual(encoded, limit)
                         with tempfile.TemporaryDirectory() as folder:
                             root = Path(folder)
@@ -183,6 +191,45 @@ class ThresholdTests(unittest.TestCase):
                                     f.restore_target(target, root)
                                 self.assertEqual(target.read_bytes(), img.data)
 
+    def test_existing_734k_patch_upgrades_at_same_threshold(self):
+        img, funcs = fixture('x86_64', newer=True)
+        legacy = bytearray(img.data)
+        for change in f.build_x86_64_plan(img, funcs, 734000)['changes']:
+            offset = int(change['offset'], 16)
+            payload = bytearray.fromhex(change['after'])
+            if change['name'] == 'trampolineHost_trampoline':
+                # Previously the 734K write was gated on a 256K input.
+                payload[5:28] = bytes.fromhex('488b4a204885c974158b480c81f900e80300750a0f1f00')
+            legacy[offset:offset + len(payload)] = payload
+
+        def image(data):
+            result = _FakeImage('x86_64', data, img.segments)
+            result.fmt = 'ELF'
+            return result
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target, backup = root / 'agy', root / 'original.bak'
+            target.write_bytes(legacy)
+            backup.write_bytes(img.data)
+            old_hash = hashlib.sha256(legacy).hexdigest()
+            (root / 'agy-test-manifest-legacy.json').write_text(json.dumps(dict(
+                sha256=hashlib.sha256(img.data).hexdigest(), patched_sha256=old_hash, backup_path=str(backup))))
+            with patch.object(f, 'BinaryImage', side_effect=image), \
+                 patch.object(f, 'locate_go_functions', return_value=(0, 0x400000, funcs, {})), \
+                 patch.object(f, 'choose_trampoline_host', return_value=(funcs['trampolineHost'], False)), \
+                 patch.object(f, 'get_binary_version', return_value='test'), \
+                 patch.object(f, 'wait_for_backends'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                report = f.analyze_binary(target, backup_dir=root)
+                self.assertEqual(report['status'], 'UNPATCHED')
+                self.assertEqual(report['context_limit'], 734000)
+                self.assertEqual(report['target_disk_sha256'], old_hash)
+                f.patch_target(target, root, context_limit=734000)
+                self.assertEqual(f.analyze_binary(target, backup_dir=False)['status'], 'ALREADY_PATCHED')
+                f.restore_target(target, root)
+                self.assertEqual(target.read_bytes(), img.data)
+
     def test_cli_menu_selection_reaches_patch(self):
         target = Path('agy').resolve()
         report = {'compatible': True, 'binaries': [{'path': str(target), 'status': 'UNPATCHED'}]}
@@ -199,15 +246,15 @@ class ThresholdTests(unittest.TestCase):
     def test_cli_custom_limit_skips_menu_and_status_detects_without_prompt(self):
         target = Path('agy').resolve()
         report = {'compatible': True, 'binaries': [{'path': str(target), 'status': 'UNPATCHED'}]}
-        with patch('sys.argv', ['fix', '--target', str(target), '--context-limit', '600000']), \
+        with patch('sys.argv', ['fix', '--target', str(target), '--context-limit', '40000']), \
              patch('builtins.input', side_effect=['Y', '2']) as prompt, \
              patch.object(f, 'preflight', return_value=report) as preflight, \
              patch.object(f, 'wait_for_backends'), patch.object(Path, 'exists', return_value=True), \
              patch.object(f, 'patch_target') as modify, contextlib.redirect_stdout(io.StringIO()):
             f.main()
         self.assertEqual(prompt.call_count, 2)
-        self.assertEqual(preflight.call_args.kwargs['context_limit'], 600000)
-        self.assertEqual(modify.call_args.kwargs['context_limit'], 600000)
+        self.assertEqual(preflight.call_args.kwargs['context_limit'], 40000)
+        self.assertEqual(modify.call_args.kwargs['context_limit'], 40000)
         with patch('sys.argv', ['fix', '--target', str(target), '--status']), \
              patch('builtins.input') as prompt, \
              patch.object(f, 'preflight', return_value=report) as preflight, \
