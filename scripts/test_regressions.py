@@ -439,11 +439,16 @@ class RegressionTests(unittest.TestCase):
         self.assertGreaterEqual(chosen['file_end'] - chosen['file_start'], f.HOST_SPAN[img.arch])
         if any(n.endswith(f.HOST_PREFERENCE[0]) for n in hosts):
             self.assertTrue(chosen['symbol'].endswith(f.HOST_PREFERENCE[0]))
-        reduced = {n: v for n, v in hosts.items() if not n.endswith(f.HOST_PREFERENCE)}
+        setter_prefs = tuple(s for s in f.HOST_PREFERENCE if s not in f.HOST_FALLBACK_SYMBOLS)
+        if any(n.endswith(setter_prefs) for n in hosts):
+            reduced = {n: v for n, v in hosts.items() if not n.endswith(setter_prefs)}
+        else:
+            reduced = {n: v for n, v in hosts.items() if n != chosen['symbol']}
         fallback, _ = f.choose_trampoline_host(img, funcs, reduced, text_va)
         self.assertIn(fallback['symbol'], reduced)
+        self.assertNotEqual(fallback['symbol'], chosen['symbol'])
         self.assertGreaterEqual(fallback['file_end'] - fallback['file_start'], f.HOST_SPAN[img.arch])
-        # Builds without any CheckpointConfig method must fail, never fall back to
+        # Builds without any candidate host must fail, never fall back to
         # hooks.checkpointNeeded, which hosts native auto-compaction.
         with self.assertRaises(RuntimeError):
             f.choose_trampoline_host(img, funcs, {}, text_va)

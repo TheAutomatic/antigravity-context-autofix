@@ -40,6 +40,14 @@ class MachOTests(unittest.TestCase):
         self.assertEqual((image.fmt, image.arch), ('Mach-O', 'x86_64'))
         self.assertEqual(image.va_to_file(0x100000068), 104)
 
+    def test_unsupported_cpu_and_universal_macho_rejected(self):
+        bad_cpu = struct.pack('<8I', 0xFEEDFACF, 0x00000007, 0, 2, 0, 0, 0, 0)
+        with self.assertRaisesRegex(ValueError, 'Unsupported Mach-O CPU'):
+            f.BinaryImage(bad_cpu)
+        for fat_magic in (b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'):
+            with self.subTest(magic=fat_magic.hex()), self.assertRaisesRegex(ValueError, 'Universal'):
+                f.BinaryImage(fat_magic + bytes(60))
+
     def test_invalid_commands(self):
         for offset, value in ((20, 1000), (36, 0), (36, 200)):
             data = bytearray(self.image())

@@ -10,10 +10,10 @@
 |---|---|---|---|
 | Windows | x86_64 / PE | Antigravity IDE、Antigravity Desktop、agy CLI | 本机 IDE / CLI (`agy.exe` 1.4.12 & 1.5.0) 与 Desktop (`language_server.exe`) 已实测修改、启动与新请求窗口 |
 | Windows | ARM64 / PE | 暂不列入预期范围 | 未验证，不保证适配 |
-| Linux | x86_64 / ELF（含 PIE/ET_DYN） | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实测：Arch Linux（rolling，内核 7.2.14-zen1-1-zen，Python 3.14.9，glibc 2.44）上对 agy 1.5.5 & 1.5.6（Go 1.28 构建）与 Desktop `language_server` 完成修改、启动与新请求窗口验证（512000 / 734000）。PIE 构建的 moduledata 文本指针在文件中为 0，现通过 `.rela.dyn` 的 `R_*_RELATIVE` 附加数恢复 text 基址 |
-| Linux | ARM64（aarch64）/ ELF | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持（含 PIE `.rela.dyn` 解析，`R_AARCH64_RELATIVE`）；仅有合成 ELF 单元测试覆盖，未完成 ARM64 实机验证 |
-| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE / CLI (`agy` 1.4.12 & 1.5.0) 已实测修改、签名、启动与新请求窗口 |
-| macOS | x86_64（Intel）/ 薄格式 Mach-O | Antigravity Desktop、IDE、agy CLI | 本机 Desktop (`language_server` 2.29.0) 实测修改、签名、启动与 1M 窗口生效 |
+| Linux | x86_64 / ELF（含 PIE/ET_DYN 与静态 musl） | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实测：Arch Linux（rolling，glibc 2.44）上对 agy 1.5.5 & 1.5.6 与 Desktop `language_server`，以及 Debian 12 x86_64 上对官方 `agy` 1.5.9（glibc PIE 与 musl `ET_EXEC`）完成补丁、启动与恢复验证。PIE 构建的 moduledata 与数据段函数指针在文件中为 0，现通过 `.rela.dyn` / `PT_DYNAMIC` 的 `R_X86_64_RELATIVE` 附加数恢复并做宿主引用校验 |
+| Linux | ARM64（aarch64）/ ELF（含 PIE/ET_DYN） | agy CLI；使用兼容后端的 IDE / Desktop 安装 | 已实现补丁支持（含 `.rela.dyn` / `PT_DYNAMIC` 的 `R_AARCH64_RELATIVE` 解析），并已通过官方 `agy` 1.5.9 Linux ARM64 PIE 实包结构与补丁分析验证；尚未在 ARM64 实机运行请求验证 |
+| macOS | ARM64（Apple Silicon）/ 薄格式 Mach-O | Antigravity IDE、agy CLI | 本机 IDE / CLI (`agy` 1.4.12 & 1.5.0) 已实测修改、签名、启动与新请求窗口；并通过 `agy` 1.5.9 实包验证 |
+| macOS | x86_64（Intel）/ 薄格式 Mach-O | Antigravity Desktop、IDE、agy CLI | 本机 Desktop (`language_server` 2.29.0) 实测修改、签名、启动与 1M 窗口生效；并通过 `agy` 1.5.9 实包验证 |
 | macOS | Universal Mach-O | 暂不支持 | 解析器只支持薄格式 Mach-O（可用 lipo 提取单架构薄格式文件） |
 
 适用与否以本机后端的结构检查结果为准，不能保证所有版本。表中的客户端是预期范围，不代表每种安装布局均已实测。

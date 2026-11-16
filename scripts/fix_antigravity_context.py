@@ -83,8 +83,10 @@ class BinaryImage:
         self.data = data
         self.fmt = None
         self.arch = None
-        self.segments = []  # (name, va, vsize, raw_ptr, raw_size, is_exec)
-        self.sections = {}  # ELF section name -> (va, file_off, size)
+        self.is_pie = False
+        self.segments = []     # (name, va, vsize, raw_ptr, raw_size, is_exec)
+        self.sections = {}     # ELF section name -> (va, file_off, size)
+        self.rela_ranges = []  # Verified ELF64 SHT_RELA / DT_RELA (file_off, byte_len)
         self._parse()
 
     def _parse(self):
@@ -119,7 +121,8 @@ class BinaryImage:
             ei_class, ei_data = self.data[4], self.data[5]
             if ei_class != 2 or ei_data != 1:
                 raise ValueError("Only 64-bit little-endian ELF is supported")
-            e_machine = struct.unpack_from("<H", self.data, 18)[0]
+            e_type, e_machine = struct.unpack_from("<HH", self.data, 16)
+            self.is_pie = e_type == 3  # ET_DYN
             if e_machine == 0x3E:
                 self.arch = "x86_64"
             elif e_machine == 0xB7:
@@ -130,6 +133,7 @@ class BinaryImage:
             e_phentsize, e_phnum = struct.unpack_from("<HH", self.data, 54)
             if e_phentsize < 56 or e_phoff + e_phentsize * e_phnum > len(self.data):
                 raise ValueError("Invalid ELF64 program header table")
+            dyn_segments = []
             for i in range(e_phnum):
                 ph = self.data[e_phoff + i * e_phentsize : e_phoff + (i + 1) * e_phentsize]
                 p_type, p_flags, p_offset, p_vaddr, _, p_filesz, p_memsz, _ = struct.unpack_from("<IIQQQQQQ", ph, 0)
@@ -138,24 +142,67 @@ class BinaryImage:
                         raise ValueError("Invalid ELF64 load segment")
                     is_exec = bool(p_flags & 1)
                     self.segments.append((f"LOAD_{i}", p_vaddr, max(p_memsz, p_filesz), p_offset, p_filesz, is_exec))
-            # Section headers (optional): needed to find .rela.dyn on PIE builds,
-            # where moduledata text pointers are zero in the file and only the
-            # R_*_RELATIVE addends carry the link-time VAs.
+                elif p_type == 2:  # PT_DYNAMIC
+                    if p_offset + p_filesz > len(self.data):
+                        raise ValueError("Invalid ELF64 dynamic segment")
+                    dyn_segments.append((p_offset, p_filesz))
+            # Section headers (optional): locate .rela.dyn on PIE builds, where
+            # moduledata and data-segment function pointers are zero in the file
+            # and carried by R_*_RELATIVE addends.
+            rela_seen = set()
             e_shoff = struct.unpack_from("<Q", self.data, 40)[0]
             e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", self.data, 58)
-            if e_shoff and e_shentsize >= 64 and e_shoff + e_shentsize * e_shnum <= len(self.data) and e_shstrndx < e_shnum:
-                str_sh = self.data[e_shoff + e_shstrndx * e_shentsize : e_shoff + (e_shstrndx + 1) * e_shentsize]
-                str_off = struct.unpack_from("<Q", str_sh, 24)[0]
+            if e_shoff and e_shentsize >= 64 and e_shnum > 0 and e_shoff + e_shentsize * e_shnum <= len(self.data):
+                str_base = None
+                str_end = 0
+                if e_shstrndx < e_shnum:
+                    str_sh = self.data[e_shoff + e_shstrndx * e_shentsize : e_shoff + (e_shstrndx + 1) * e_shentsize]
+                    _, str_type, _, _, str_off, str_size = struct.unpack_from("<IIQQQQ", str_sh, 0)
+                    if str_type == 3 and str_off <= len(self.data) and str_size <= len(self.data) - str_off:
+                        str_base = str_off
+                        str_end = str_off + str_size
                 for i in range(e_shnum):
                     sh = self.data[e_shoff + i * e_shentsize : e_shoff + (i + 1) * e_shentsize]
-                    name_off, _, _, s_va, s_off, s_size = struct.unpack_from("<IIQQQQ", sh, 0)
-                    if str_off + name_off >= len(self.data):
+                    name_off, sh_type, _, s_va, s_off, s_size = struct.unpack_from("<IIQQQQ", sh, 0)
+                    sh_entsize = struct.unpack_from("<Q", sh, 56)[0]
+                    if sh_type == 8 or s_off > len(self.data) or s_size > len(self.data) - s_off:
                         continue
-                    end = self.data.find(b"\x00", str_off + name_off)
-                    if end == -1:
-                        continue
-                    name = self.data[str_off + name_off : end].decode("ascii", errors="replace")
-                    self.sections[name] = (s_va, s_off, s_size)
+                    name = ""
+                    if str_base is not None and name_off < str_end - str_base:
+                        end = self.data.find(b"\x00", str_base + name_off, str_end)
+                        if end != -1:
+                            name = self.data[str_base + name_off : end].decode("ascii", errors="replace")
+                            self.sections[name] = (s_va, s_off, s_size)
+                    if sh_type == 4 and sh_entsize in (0, 24) and s_size >= 24 and name in (".rela.dyn", ".rela.plt"):
+                        span = (s_off, (s_size // 24) * 24)
+                        if span not in rela_seen:
+                            rela_seen.add(span)
+                            self.rela_ranges.append(span)
+            # Fallback to PT_DYNAMIC (DT_RELA/DT_RELASZ/DT_RELAENT) when section headers were stripped.
+            if not self.rela_ranges and dyn_segments:
+                for dyn_off, dyn_size in dyn_segments:
+                    dt_rela = None
+                    dt_relasz = 0
+                    dt_relaent = 0
+                    for d_tag, d_val in struct.iter_unpack("<qQ", memoryview(self.data)[dyn_off : dyn_off + (dyn_size // 16) * 16]):
+                        if d_tag == 0:
+                            break
+                        if d_tag == 7:
+                            dt_rela = d_val
+                        elif d_tag == 8:
+                            dt_relasz = d_val
+                        elif d_tag == 9:
+                            dt_relaent = d_val
+                    if dt_rela is not None and dt_relasz >= 24 and dt_relaent == 24:
+                        try:
+                            rel_off = self.va_to_file(dt_rela)
+                        except ValueError:
+                            continue
+                        if rel_off <= len(self.data) and dt_relasz <= len(self.data) - rel_off:
+                            span = (rel_off, (dt_relasz // 24) * 24)
+                            if span not in rela_seen:
+                                rela_seen.add(span)
+                                self.rela_ranges.append(span)
         elif self.data[:4] == bytes.fromhex("cffaedfe"):
             self.fmt = "Mach-O"
             if len(self.data) < 32:
@@ -188,8 +235,10 @@ class BinaryImage:
                     self.segments.append((name.rstrip(bytes([0])).decode("ascii", errors="replace"),
                                           va, vsize, raw_ptr, raw_size, bool(prot & 4)))
                 off += size
+        elif self.data[:4] in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+            raise ValueError("Universal (fat) Mach-O is not supported; extract a thin slice with lipo -thin")
         else:
-            raise ValueError("Unsupported binary format (expected PE, ELF or Mach-O)")
+            raise ValueError("Unsupported binary format (expected PE, ELF or thin 64-bit Mach-O)")
 
     def va_to_file(self, va: int) -> int:
         for _, sva, _, raw_ptr, raw_size, _ in self.segments:
@@ -210,6 +259,92 @@ def _bsearch_ftab(data: bytes, ftab_base: int, nfunc: int, target_func_off: int)
         else:
             hi = mid - 1
     return -1
+
+
+def _resolve_elf_rela_text_base(img: BinaryImage, total_len: int, exec_ranges: list, pcln_va: int | None):
+    """Recover (go_text_va, ambiguous) from ELF R_*_RELATIVE relocation addends."""
+    rela_ranges = getattr(img, "rela_ranges", ())
+    if getattr(img, "fmt", None) != "ELF" or not rela_ranges:
+        return 0, False
+    data = img.data
+    rel_type = 8 if img.arch == "x86_64" else 1027  # R_X86_64_RELATIVE / R_AARCH64_RELATIVE
+    total_rel_bytes = sum(sz for _, sz in rela_ranges)
+
+    # Fast path for multi-megabyte .rela.dyn tables: locate moduledata.pcHeader -> pcln_va
+    # entries with C bytes.find, then inspect entries matching the 6-byte r_offset prefix.
+    if pcln_va is not None and total_rel_bytes > 65536 and 0 <= pcln_va <= 0xFFFFFFFFFFFFFFFF:
+        pcln_rel = struct.pack("<QQ", rel_type, pcln_va)
+        pc_slots = []
+        for rel_off, rel_size in rela_ranges:
+            rel_end = rel_off + rel_size
+            pos = rel_off
+            while True:
+                at = data.find(pcln_rel, pos, rel_end)
+                if at == -1:
+                    break
+                if (at - rel_off) % 24 == 8:
+                    pc_slots.append(struct.unpack_from("<Q", data, at - 8)[0])
+                pos = at + 1
+        if pc_slots:
+            prefixes = set()
+            for pc_slot in pc_slots:
+                prefixes.add(struct.pack("<Q", pc_slot + 8)[2:8])
+                prefixes.add(struct.pack("<Q", pc_slot + 264)[2:8])
+            if b"\x00" * 6 not in prefixes:
+                local_relmap = {}
+                for rel_off, rel_size in rela_ranges:
+                    rel_end = rel_off + rel_size
+                    for prefix in prefixes:
+                        pos = rel_off
+                        while True:
+                            at = data.find(prefix, pos, rel_end)
+                            if at == -1:
+                                break
+                            if (at - rel_off) % 24 == 2:
+                                r_offset, r_info, r_addend = struct.unpack_from("<QQq", data, at - 2)
+                                if (r_info & 0xFFFFFFFF) == rel_type:
+                                    local_relmap[r_offset] = r_addend
+                            pos = at + 1
+                strong_hits = set()
+                for pc_slot in pc_slots:
+                    for d in range(8, 264, 8):
+                        slot = pc_slot + d
+                        addend = local_relmap.get(slot)
+                        if addend is None or addend <= 0 or not any(lo <= addend < hi for lo, hi in exec_ranges):
+                            continue
+                        etext = local_relmap.get(slot + 8)
+                        if etext is not None and etext - addend == total_len:
+                            strong_hits.add(addend)
+                if len(strong_hits) > 1:
+                    return 0, True
+                if len(strong_hits) == 1:
+                    return strong_hits.pop(), False
+
+    relmap = {}
+    for rel_off, rel_size in rela_ranges:
+        for r_offset, r_info, r_addend in struct.iter_unpack("<QQq", memoryview(data)[rel_off : rel_off + rel_size]):
+            if (r_info & 0xFFFFFFFF) == rel_type:
+                relmap[r_offset] = r_addend
+    candidates = []
+    for slot, addend in relmap.items():
+        if addend <= 0 or not any(lo <= addend < hi for lo, hi in exec_ranges):
+            continue
+        etext = relmap.get(slot + 8)
+        if etext is None or etext - addend != total_len:
+            continue
+        # moduledata.pcHeader is the first field; the minpc/maxpc (or text/etext)
+        # pair sits ~160-176 bytes after it, so a relocation to pclntab precedes it.
+        strong = pcln_va is not None and any(relmap.get(slot - d) == pcln_va for d in range(8, 264, 8))
+        candidates.append((strong, addend))
+    strong_hits = {va for strong, va in candidates if strong}
+    if len(strong_hits) > 1:
+        return 0, True
+    if len(strong_hits) == 1:
+        return strong_hits.pop(), False
+    weak_hits = {va for _, va in candidates}
+    if len(weak_hits) == 1:
+        return weak_hits.pop(), False
+    return 0, len(weak_hits) > 1
 
 
 def locate_go_functions(img: BinaryImage):
@@ -312,7 +447,7 @@ def locate_go_functions(img: BinaryImage):
                                 break
                             for m_off in range(at + 8, at + 240, 8):
                                 minpc, maxpc = struct.unpack_from("<QQ", data, m_off)
-                                if maxpc - minpc == total_len and any(lo <= minpc < hi for lo, hi in exec_ranges):
+                                if minpc > 0 and maxpc - minpc == total_len and any(lo <= minpc < hi for lo, hi in exec_ranges):
                                     go_text_va = minpc
                                     break
                             if go_text_va != 0:
@@ -320,55 +455,23 @@ def locate_go_functions(img: BinaryImage):
                             s_pos = at + 1
                         if go_text_va != 0:
                             break
+                ambiguous_reloc = False
                 if go_text_va == 0:
+                    go_text_va, ambiguous_reloc = _resolve_elf_rela_text_base(img, total_len, exec_ranges, pcln_va)
+                # Unverified raw (minpc, maxpc) fallback is only safe on non-PIE builds:
+                # on PIE ELF (ET_DYN), LOAD_0 starts at vaddr 0 and moduledata slots are
+                # relocated rather than stored in raw bytes.
+                if go_text_va == 0 and not ambiguous_reloc and not getattr(img, "is_pie", False):
                     for _, _, _, raw_ptr, raw_size, is_exec in img.segments:
                         if is_exec:
                             continue
                         for off in range(raw_ptr, raw_ptr + raw_size - 16, 8):
                             minpc, maxpc = struct.unpack_from("<QQ", data, off)
-                            if maxpc - minpc == total_len and any(lo <= minpc < hi for lo, hi in exec_ranges):
+                            if minpc > 0 and maxpc - minpc == total_len and any(lo <= minpc < hi for lo, hi in exec_ranges):
                                 go_text_va = minpc
                                 break
                         if go_text_va != 0:
                             break
-            if go_text_va == 0 and img.fmt == "ELF" and ".rela.dyn" in img.sections:
-                # PIE ELF (ET_DYN): moduledata.text/etext are pointer slots that
-                # the dynamic loader fills via R_*_RELATIVE relocations, so the
-                # file bytes are zero and a raw moduledata scan cannot work.
-                # Recover the link-time VAs from the relocation addends instead:
-                # find consecutive slots (S, S+8) whose addends (minpc, maxpc)
-                # satisfy maxpc - minpc == ftab total_len with minpc inside an
-                # executable segment. Cross-check against a nearby relocation
-                # to the pclntab VA (moduledata.pcHeader precedes the pair).
-                rel_va, rel_off, rel_size = img.sections[".rela.dyn"]
-                rel_type = 8 if img.arch == "x86_64" else 1027  # R_X86_64_RELATIVE / R_AARCH64_RELATIVE
-                total_len = struct.unpack_from("<I", data, ftab_base + nfunc * 8)[0]
-                exec_ranges = [(sva, sva + svsize) for _, sva, svsize, _, _, is_exec in img.segments if is_exec]
-                pcln_va = next((sva + (idx - raw_ptr) for _, sva, _, raw_ptr, raw_size, _ in img.segments
-                                if raw_ptr <= idx < raw_ptr + raw_size), None)
-                relmap = {}
-                for i in range(rel_size // 24):
-                    r_offset, r_info, r_addend = struct.unpack_from("<QQq", data, rel_off + i * 24)
-                    if (r_info & 0xFFFFFFFF) == rel_type:
-                        relmap[r_offset] = r_addend
-                candidates = []
-                for slot, addend in relmap.items():
-                    if not any(lo <= addend < hi for lo, hi in exec_ranges):
-                        continue
-                    etext = relmap.get(slot + 8)
-                    if etext is None or etext - addend != total_len:
-                        continue
-                    # moduledata.pcHeader is the first field; the minpc/maxpc
-                    # (or text/etext) pair sits ~160-176 bytes after it, so a
-                    # relocation to the pclntab VA must appear just before.
-                    strong = pcln_va is not None and any(
-                        relmap.get(slot - d) == pcln_va for d in range(8, 264, 8))
-                    candidates.append((strong, addend))
-                strong_hits = {va for strong, va in candidates if strong}
-                if len(strong_hits) == 1:
-                    go_text_va = strong_hits.pop()
-                elif not strong_hits and len({va for _, va in candidates}) == 1:
-                    go_text_va = candidates[0][1]
             if go_text_va == 0:
                 raise RuntimeError("Found pclntab but could not resolve Go text base VA from moduledata")
             funcs = {}
@@ -458,15 +561,41 @@ def collect_text_references(img: BinaryImage, go_text_va: int, wanted):
 
 
 def stored_address_present(img: BinaryImage, func_va: int):
-    """True if any data word holds this VA: funcval, itab or table entry."""
+    """True if any data word or ELF R_*_RELATIVE addend holds this VA: funcval, itab or table entry."""
+    rela_ranges = tuple(getattr(img, "rela_ranges", ()))
+    if getattr(img, "fmt", None) == "ELF" and rela_ranges and 0 <= func_va <= 0xFFFFFFFFFFFFFFFF:
+        rel_type = 8 if img.arch == "x86_64" else 1027
+        rel_needle = struct.pack("<QQ", rel_type, func_va)
+        for rel_off, rel_size in rela_ranges:
+            rel_end = rel_off + rel_size
+            pos = rel_off
+            while True:
+                at = img.data.find(rel_needle, pos, rel_end)
+                if at == -1:
+                    break
+                if (at - rel_off) % 24 == 8:
+                    return True
+                pos = at + 1
     needle = struct.pack("<Q", func_va)
     for name, _, _, raw_ptr, raw_size, _ in img.segments:
         # Executable segments still hold constants and pointers, so only debug
         # and relocation metadata are excluded.
         if not raw_size or name.startswith(DATA_SEGMENT_SKIP):
             continue
-        if img.data.find(needle, raw_ptr, raw_ptr + raw_size) != -1:
-            return True
+        seg_end = raw_ptr + raw_size
+        pos = raw_ptr
+        while pos < seg_end:
+            at = img.data.find(needle, pos, seg_end)
+            if at == -1:
+                break
+            hit_rel_end = next(
+                (rel_off + rel_size for rel_off, rel_size in rela_ranges
+                 if at + 8 > rel_off and at < rel_off + rel_size),
+                None,
+            )
+            if hit_rel_end is None:
+                return True
+            pos = hit_rel_end
     return False
 
 
@@ -1222,8 +1351,8 @@ def discover_default_targets() -> list[Path]:
     home = Path.home()
     names = ("agy.exe", "language_server.exe") if sys.platform == "win32" else (
         "agy", "language_server", "language_server_macos_arm", "language_server_macos_arm64",
-        "language_server_macos", "language_server_macos_x64", "language_server_linux_x64", "language_server_linux_arm",
-        "language_server_linux_arm64")
+        "language_server_macos", "language_server_macos_x64", "language_server_macos_x86_64",
+        "language_server_linux_x64", "language_server_linux_arm", "language_server_linux_arm64")
     candidates = [home / ".gemini/bin" / names[0], home / ".local/bin" / names[0]]
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if entry:
